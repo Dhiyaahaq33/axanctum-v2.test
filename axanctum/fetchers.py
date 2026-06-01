@@ -31,13 +31,15 @@ def create_session() -> aiohttp.ClientSession:
         ttl_dns_cache=300,
         family=socket.AF_INET,   # paksa IPv4 — Binance blok IPv6 dari VPS
     )
-    return aiohttp.ClientSession(connector=connector)
+    return aiohttp.ClientSession(connector=connector, trust_env=True)
 
 
 async def _get(
     session: aiohttp.ClientSession,
     url: str,
     params: Optional[Dict] = None,
+    *,
+    warn: bool = False,
 ) -> Optional[Any]:
     """Generic async GET → JSON. Returns None on any error."""
     try:
@@ -45,13 +47,25 @@ async def _get(
         async with session.get(url, params=params, timeout=timeout) as resp:
             if resp.status == 200:
                 return await resp.json(content_type=None)
-            log.debug(f"HTTP {resp.status} | {url} | params={params}")
+            msg = f"HTTP {resp.status} | {url} | params={params}"
+            if warn:
+                log.warning(msg)
+            else:
+                log.debug(msg)
             return None
     except asyncio.TimeoutError:
-        log.debug(f"Timeout: {url}")
+        msg = f"Timeout: {url}"
+        if warn:
+            log.warning(msg)
+        else:
+            log.debug(msg)
         return None
     except Exception as exc:
-        log.debug(f"GET error [{url}]: {exc}")
+        msg = f"GET error [{url}]: {exc}"
+        if warn:
+            log.warning(msg)
+        else:
+            log.debug(msg)
         return None
 
 
@@ -64,8 +78,28 @@ async def fetch_full_symbol_pool(
     Diambil hingga TOTAL_POOL koin teratas.
     """
     try:
-        info = await _get(session, f"{FUTURES_BASE}/fapi/v1/exchangeInfo")
+        attempts = int(CONFIG.get("POOL_RETRY_ATTEMPTS", 3))
+
+        info = None
+        for attempt in range(1, attempts + 1):
+            info = await _get(
+                session,
+                f"{FUTURES_BASE}/fapi/v1/exchangeInfo",
+                warn=True,
+            )
+            if info:
+                break
+            if attempt < attempts:
+                wait = min(10 * attempt, 30)
+                log.warning(
+                    f"exchangeInfo kosong/timeout — retry {attempt}/{attempts} "
+                    f"dalam {wait}s"
+                )
+                await asyncio.sleep(wait)
         if not info:
+            log.warning(
+                f"exchangeInfo tidak tersedia dari {FUTURES_BASE} — pool kosong."
+            )
             return []
 
         perp_set = {
@@ -80,9 +114,24 @@ async def fetch_full_symbol_pool(
         # (exchangeInfo response besar → rate limit jika langsung dilanjut)
         await asyncio.sleep(3)
 
-        tickers = await _get(session, f"{FUTURES_BASE}/fapi/v1/ticker/24hr")
+        tickers = None
+        for attempt in range(1, attempts + 1):
+            tickers = await _get(
+                session,
+                f"{FUTURES_BASE}/fapi/v1/ticker/24hr",
+                warn=True,
+            )
+            if tickers:
+                break
+            if attempt < attempts:
+                wait = min(10 * attempt, 30)
+                log.warning(
+                    f"ticker/24hr kosong/timeout — retry {attempt}/{attempts} "
+                    f"dalam {wait}s"
+                )
+                await asyncio.sleep(wait)
         if not tickers:
-            log.warning("Ticker tidak tersedia — pool kosong.")
+            log.warning(f"Ticker tidak tersedia dari {FUTURES_BASE} — pool kosong.")
             return []
 
         # Volume minimum absolut = volume floor siklus terkecil

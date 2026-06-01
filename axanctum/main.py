@@ -36,6 +36,14 @@ async def main_async() -> None:
                 log.info(f"  🔄 Putaran ke-{full_cycle_count} — Refresh daftar koin dari Binance")
                 log.info(f"{'═'*60}")
                 pool       = await fetch_full_symbol_pool(session)
+                if not pool:
+                    wait_sec = CONFIG.get("POOL_EMPTY_SLEEP_SEC", 120)
+                    log.warning(
+                        f"Pool Binance kosong — skip putaran dan retry refresh "
+                        f"dalam {wait_sec}s"
+                    )
+                    await asyncio.sleep(wait_sec)
+                    continue
                 partitions = partition_symbols(pool)
 
             current_cfg    = cycles_cfg[cycle_idx]

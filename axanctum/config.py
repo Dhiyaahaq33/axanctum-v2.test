@@ -64,13 +64,15 @@ CONFIG: Dict = {
     # ── Concurrency & Network ─────────────────────────────────────────────
     "CONCURRENT_TASKS":   25,
     "REQUEST_TIMEOUT":    15,
+    "POOL_RETRY_ATTEMPTS": 3,
+    "POOL_EMPTY_SLEEP_SEC": 120,
     "MSG_DELAY":          0.6,
     "SSL_VERIFY":         False,
 }
 
 # ── API Base URLs ─────────────────────────────────────────────────────
-SPOT_BASE    = "https://api.binance.com"
-FUTURES_BASE = "https://fapi.binance.com"
+SPOT_BASE    = os.environ.get("SPOT_BASE", "https://api.binance.com").rstrip("/")
+FUTURES_BASE = os.environ.get("FUTURES_BASE", "https://fapi.binance.com").rstrip("/")
 TELEGRAM_API = "https://api.telegram.org"
 
 # ── Grade scale ───────────────────────────────────────────────────────
