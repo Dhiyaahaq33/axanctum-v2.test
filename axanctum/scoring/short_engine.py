@@ -3,6 +3,20 @@ from __future__ import annotations
 from typing import List, Tuple
 
 
+def _add_unique(items: List[str], value: str) -> None:
+    if value and value not in items:
+        items.append(value)
+
+
+def _extend_unique(items: List[str], values: List[str]) -> None:
+    for value in values:
+        _add_unique(items, value)
+
+
+def _clamp_score(score: float) -> float:
+    return max(0.0, min(100.0, score))
+
+
 def calc_long_squeeze_score(
     delta_price:  float,
     delta_oi:     float,
@@ -291,3 +305,214 @@ def calc_bearish_divergence_score(
         return 0.0, [], []
 
     return score, flags, contexts
+
+
+def calc_integrated_short_score(
+    *,
+    delta_price: float,
+    delta_price_short: float,
+    price_change_24h: float,
+    delta_cvd_spot: float,
+    delta_cvd_fut: float,
+    delta_oi: float,
+    funding_rate: float,
+    d_vwap: float,
+    vol_ratio: float,
+    squeeze_type: str,
+    squeeze_stage: str,
+    ls_score: float,
+    ls_flags: List[str],
+    ls_contexts: List[str],
+    dist_score: float,
+    dist_flags: List[str],
+    dist_contexts: List[str],
+    div_score: float,
+    div_flags: List[str],
+    div_contexts: List[str],
+) -> Tuple[float, List[str], List[str], List[str]]:
+    """
+    Integrated SHORT decision branch.
+
+    Fungsi ini membuat short berdiri sejajar dengan long:
+    data/indikator yang sama dibaca ulang sebagai tekanan turun,
+    distribusi, breakdown, long squeeze, atau exhaustion after pump.
+    LS/DIST/DIV lama tetap dipakai sebagai sub-interpretasi.
+    """
+    setup_scores: List[Tuple[str, float, List[str], List[str]]] = []
+
+    both_cvd_bearish = delta_cvd_spot < 0 and delta_cvd_fut < 0
+    any_cvd_bearish = delta_cvd_spot < -1.0 or delta_cvd_fut < -1.0
+    funding_positive = funding_rate > 0.0001
+    funding_hot = funding_rate > 0.0008
+    oi_hot = delta_oi > 4.0
+    oi_deleveraging = delta_oi < -2.0
+    below_vwap = d_vwap < 0
+
+    # ── 1) Bear continuation: cocok untuk tape bearish sepanjang hari ──
+    bear_score = 0.0
+    bear_flags: List[str] = []
+    bear_contexts: List[str] = []
+    if price_change_24h <= -1.0:
+        bear_score += 14.0 + min(abs(price_change_24h) / 8.0, 1.0) * 10.0
+        _add_unique(bear_flags, "BEAR_CONTINUATION_SHORT")
+        bear_contexts.append(f"📉 24h bearish {price_change_24h:+.1f}% — tekanan turun aktif")
+    if delta_price <= -0.4:
+        bear_score += 8.0 + min(abs(delta_price) / 4.0, 1.0) * 6.0
+    if delta_price_short <= -0.6:
+        bear_score += 8.0
+        bear_contexts.append(f"⏬ Momentum pendek {delta_price_short:+.1f}% masih menekan")
+    if below_vwap:
+        bear_score += 8.0 + min(abs(d_vwap) / 5.0, 1.0) * 6.0
+        _add_unique(bear_flags, "VWAP_BELOW")
+    if both_cvd_bearish:
+        bear_score += 18.0
+        _add_unique(bear_flags, "CVD_CONFLUENCE_BEARISH")
+        bear_contexts.append(
+            f"🔴 CVD Spot{delta_cvd_spot:+.1f}% Fut{delta_cvd_fut:+.1f}% — jual searah"
+        )
+    elif any_cvd_bearish:
+        bear_score += 9.0
+    if funding_positive and delta_price <= 0:
+        bear_score += 6.0 + (4.0 if funding_hot else 0.0)
+        _add_unique(bear_flags, "FR_LONG_CROWD")
+    if oi_deleveraging and delta_price <= 0:
+        bear_score += 4.0
+        _add_unique(bear_flags, "OI_DELEVERAGING")
+    if vol_ratio >= 1.2:
+        bear_score += 5.0
+
+    if bear_score >= 48.0 and below_vwap and any_cvd_bearish:
+        setup_scores.append(("bear_continuation_short", bear_score, bear_flags, bear_contexts))
+
+    # ── 2) Breakdown: transisi dari netral ke bawah VWAP ───────────────
+    breakdown_score = 0.0
+    breakdown_flags: List[str] = []
+    breakdown_contexts: List[str] = []
+    if -5.0 <= price_change_24h <= 2.0 and delta_price_short <= -0.8 and d_vwap <= -0.4:
+        breakdown_score = 34.0
+        _add_unique(breakdown_flags, "BREAKDOWN_SHORT")
+        breakdown_contexts.append(
+            f"📉 Breakdown: 24h {price_change_24h:+.1f}% dan harga mulai lepas dari VWAP"
+        )
+        if both_cvd_bearish:
+            breakdown_score += 18.0
+            _add_unique(breakdown_flags, "CVD_CONFLUENCE_BEARISH")
+        elif any_cvd_bearish:
+            breakdown_score += 10.0
+        if delta_oi > 1.5:
+            breakdown_score += 8.0
+            _add_unique(breakdown_flags, "OI_HOT_BEARISH")
+        if funding_positive:
+            breakdown_score += 7.0
+            _add_unique(breakdown_flags, "FR_LONG_CROWD")
+        if vol_ratio >= 1.0:
+            breakdown_score += 5.0
+        if breakdown_score >= 50.0:
+            setup_scores.append(("breakdown_short", breakdown_score, breakdown_flags, breakdown_contexts))
+
+    # ── 3) Long squeeze: longs masih punya fuel untuk dipaksa turun ─────
+    if squeeze_type == "long" and ls_score > 0:
+        squeeze_score = ls_score
+        squeeze_flags = list(ls_flags)
+        squeeze_contexts = list(ls_contexts)
+        if price_change_24h < 0:
+            squeeze_score += 5.0
+        if delta_price_short < 0:
+            squeeze_score += 4.0
+        if both_cvd_bearish:
+            squeeze_score += 5.0
+            _add_unique(squeeze_flags, "CVD_CONFLUENCE_BEARISH")
+        setup_scores.append(("long_squeeze_short", squeeze_score, squeeze_flags, squeeze_contexts))
+
+    # ── 4) Distribution: smart money jual saat market belum sadar ──────
+    if dist_score > 0:
+        distribution_score = dist_score
+        distribution_flags = ["DISTRIBUTION_SHORT"]
+        distribution_contexts = list(dist_contexts)
+        _extend_unique(distribution_flags, dist_flags)
+        if price_change_24h <= 0:
+            distribution_score += 5.0
+        if d_vwap > 1.5:
+            distribution_score += 6.0
+        if funding_positive:
+            distribution_score += 4.0
+        setup_scores.append(("distribution_short", distribution_score, distribution_flags, distribution_contexts))
+
+    # ── 5) Exhaustion after pump: fade pucuk, bukan trend-follow short ──
+    pumpish = price_change_24h >= 3.0 or delta_price >= 1.2 or d_vwap >= 3.0
+    exhaustion_evidence = dist_score > 0 or div_score > 0 or delta_cvd_spot < -1.0 or delta_cvd_fut < -1.0
+    if pumpish and exhaustion_evidence:
+        pump_ref = max(price_change_24h, delta_price, d_vwap)
+        exhaustion_score = 30.0 + min(max(pump_ref, 0.0) / 8.0, 1.0) * 16.0
+        exhaustion_flags = ["EXHAUSTION_AFTER_PUMP_SHORT"]
+        exhaustion_contexts = [
+            f"🪫 Exhaustion after pump: 24h {price_change_24h:+.1f}% VWAP {d_vwap:+.1f}%"
+        ]
+        if dist_score > 0:
+            exhaustion_score += min(dist_score * 0.35, 18.0)
+            _extend_unique(exhaustion_flags, dist_flags)
+        if div_score > 0:
+            exhaustion_score += min(div_score * 0.30, 16.0)
+            _extend_unique(exhaustion_flags, div_flags)
+        if funding_hot or oi_hot:
+            exhaustion_score += 8.0
+            _add_unique(exhaustion_flags, "D_EXHAUSTION")
+        setup_scores.append(("exhaustion_after_pump_short", exhaustion_score, exhaustion_flags, exhaustion_contexts))
+
+    # ── 6) Bearish divergence: harga belum jatuh tapi flow sudah rusak ─
+    if div_score > 0:
+        divergence_score = div_score
+        divergence_flags = ["BEARISH_DIVERGENCE_SHORT"]
+        divergence_contexts = list(div_contexts)
+        _extend_unique(divergence_flags, div_flags)
+        if price_change_24h >= -2.0:
+            divergence_score += 5.0
+        if d_vwap > 1.0:
+            divergence_score += 4.0
+        if funding_hot or oi_hot:
+            divergence_score += 5.0
+        setup_scores.append(("bearish_divergence_short", divergence_score, divergence_flags, divergence_contexts))
+
+    if not setup_scores:
+        return 0.0, [], [], []
+
+    setup_scores.sort(key=lambda x: x[1], reverse=True)
+    primary_setup, score, flags, contexts = setup_scores[0]
+    setups = [name for name, _, _, _ in setup_scores]
+
+    if len(setups) > 1:
+        score += min((len(setups) - 1) * 4.0, 10.0)
+        contexts.append(f"🧩 {len(setups)} short setup selaras: {', '.join(setups[:3])}")
+
+    _add_unique(flags, "SHORT_ENGINE")
+    _add_unique(flags, primary_setup.upper())
+
+    # ── Anti-late-entry guard: jangan short dasar yang sudah terlalu jauh ─
+    late_drop = price_change_24h <= -12.0 and d_vwap <= -6.0
+    if late_drop and primary_setup not in ("long_squeeze_short", "bear_continuation_short"):
+        score *= 0.65
+        contexts.append("⚠️ Drop 24h sudah jauh — short dipenalti agar tidak entry di dasar")
+    elif price_change_24h <= -18.0:
+        score *= 0.75
+        contexts.append("⚠️ 24h sangat oversold — target short harus konservatif")
+
+    # Flow conflict: CVD dua market malah beli, short harus turun kualitas.
+    if delta_cvd_spot > 2.0 and delta_cvd_fut > 2.0:
+        score *= 0.55
+        _add_unique(flags, "SHORT_FLOW_CONFLICT")
+        contexts.append("⚠️ CVD dua market bullish — short ditahan")
+
+    if squeeze_type == "long_exhausted":
+        score *= 0.60
+        contexts.append("🔄 Long squeeze exhausted — rawan bounce, short ditahan")
+
+    if vol_ratio < 0.5:
+        score *= 0.85
+        contexts.append("📉 Volume sepi — short kurang konfirmasi")
+
+    score = round(_clamp_score(score), 1)
+    if score < 25.0:
+        return 0.0, [], [], []
+
+    contexts.insert(0, f"▼ SHORT {primary_setup.replace('_', ' ')} — score {score:.1f}")
+    return score, flags, contexts, setups

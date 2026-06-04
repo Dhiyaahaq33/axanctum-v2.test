@@ -273,7 +273,16 @@ def build_telegram_message(r: Dict, signal_type: str = "LONG", regime_ctx=None) 
         fuel = r.get("squeeze_fuel", 0)
         signal_parts.append(f"💀 Long Squeeze {fuel:.0f}%")
     if "LONG_SQUEEZE_EXHAUSTED"  in flags: signal_parts.append("🔄 LS Exhausted")
+    if "BEAR_CONTINUATION_SHORT" in flags: signal_parts.append("📉 Bear Continuation")
+    if "BREAKDOWN_SHORT"         in flags: signal_parts.append("⏬ Breakdown")
+    if "EXHAUSTION_AFTER_PUMP_SHORT" in flags: signal_parts.append("🪫 Pump Exhaustion")
+    if "DISTRIBUTION_SHORT"      in flags: signal_parts.append("🪤 Distribution Short")
+    if "BEARISH_DIVERGENCE_SHORT" in flags: signal_parts.append("🎭 Bearish Divergence")
     if "CVD_CONFLUENCE_BEARISH"  in flags: signal_parts.append("🔴 CVD Bearish")
+    if "FR_LONG_CROWD"           in flags: signal_parts.append("💸 Long Crowded")
+    if "OI_HOT_BEARISH"          in flags: signal_parts.append("⚠️ OI Hot Bear")
+    if "OI_DELEVERAGING"         in flags: signal_parts.append("💧 OI Deleveraging")
+    if "VWAP_BELOW"              in flags: signal_parts.append("📏 Below VWAP")
     if "D_EXHAUSTION"            in flags: signal_parts.append("💀 Overleveraged")
     if "E_DISTRIBUTION"          in flags: signal_parts.append("🪤 Distribution")
     if "ABSORPTION"              in flags: signal_parts.append("🧱 Absorption")
@@ -293,6 +302,8 @@ def build_telegram_message(r: Dict, signal_type: str = "LONG", regime_ctx=None) 
         warnings.append("💀 Long Squeeze aktif — HINDARI LONG, pertimbangkan SHORT")
     if "LONG_SQUEEZE_EXHAUSTED" in flags:
         warnings.append("🔄 Long Squeeze selesai — setup reversal/bounce terbentuk")
+    if "SHORT_FLOW_CONFLICT" in flags:
+        warnings.append("⚠️ Flow konflik — CVD bullish menahan validitas short")
     # CVD-Vol warning dari contexts
     for c in r.get("contexts", []):
         if "CVD-Vol Inconsistent" in c:

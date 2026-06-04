@@ -165,6 +165,7 @@ def calculate_market_breadth(
     long_scores = [float(r.get("score_regime_adj", r.get("score", 0.0))) for r in results]
     short_scores = [
         max(
+            float(r.get("short_score_regime_adj", r.get("short_score", 0.0))),
             float(r.get("ls_score", 0.0)),
             float(r.get("dist_score", 0.0)),
             float(r.get("div_score_adj", r.get("div_score", 0.0))),

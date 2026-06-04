@@ -483,6 +483,46 @@ def calc_price_targets(
         targets["target2"]    = round(vwap * 0.985, 6)  # sedikit di bawah VWAP
         targets["invalidasi"] = round(price * 1.015, 6) # 1.5% di atas = sinyal invalid
 
+    # ── Integrated SHORT: Bearish Continuation / Breakdown ────────────
+    elif any(f in flags for f in ["BEAR_CONTINUATION_SHORT", "BREAKDOWN_SHORT"]):
+        targets["direction"] = "SHORT — Bear Continuation"
+        targets["horizon"]   = "2–6 candle"
+
+        if "BREAKDOWN_SHORT" in flags:
+            mult1, mult2, inv = 1.3, 2.2, 0.75
+            targets["rationale"] = "Breakdown dari area netral — target ekstensi ATR ke bawah"
+        else:
+            mult1, mult2, inv = 1.1, 1.9, 0.85
+            targets["rationale"] = "Trend bearish aktif — target lanjutan konservatif"
+
+        targets["target1"]    = round(price * (1 - atr_pct / 100 * mult1), 6)
+        targets["target2"]    = round(price * (1 - atr_pct / 100 * mult2), 6)
+        targets["invalidasi"] = round(price * (1 + atr_pct / 100 * inv), 6)
+
+    # ── Integrated SHORT: Distribution / Divergence / Pump Exhaustion ─
+    elif any(
+        f in flags
+        for f in [
+            "DISTRIBUTION_SHORT",
+            "BEARISH_DIVERGENCE_SHORT",
+            "EXHAUSTION_AFTER_PUMP_SHORT",
+        ]
+    ):
+        targets["direction"] = "SHORT — Distribution / Exhaustion"
+        targets["horizon"]   = "1–5 candle"
+        targets["rationale"] = "Distribusi/exhaustion — target utama mean reversion"
+
+        if d_vwap > 0:
+            t1 = min(vwap, price * (1 - atr_pct / 100 * 0.9))
+            t2 = min(vwap * 0.985, price * (1 - atr_pct / 100 * 1.8))
+        else:
+            t1 = price * (1 - atr_pct / 100 * 1.0)
+            t2 = price * (1 - atr_pct / 100 * 1.7)
+
+        targets["target1"]    = round(t1, 6)
+        targets["target2"]    = round(t2, 6)
+        targets["invalidasi"] = round(price * (1 + atr_pct / 100 * 0.8), 6)
+
     # ── Skenario B: Speculative ───────────────────────────────────────
     elif "B_SPECULATIVE" in flags:
         targets["direction"]  = "SPECULATIVE BULLISH ⚠️"
