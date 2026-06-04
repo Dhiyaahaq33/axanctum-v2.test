@@ -37,6 +37,9 @@ class RegimeContext:
 class MarketBreadthContext:
     """Ringkasan kondisi market-wide dari hasil scan batch."""
     total: int
+    price24_up_pct: float
+    price24_down_pct: float
+    avg_price24_change: float
     above_vwap_pct: float
     below_vwap_pct: float
     cvd_bull_pct: float
@@ -51,3 +54,8 @@ class MarketBreadthContext:
     avg_short_score: float
     long_candidates: int
     short_candidates: int
+    direction: str
+    strength: float
+    long_mode: str
+    short_mode: str
+    confirmations: int

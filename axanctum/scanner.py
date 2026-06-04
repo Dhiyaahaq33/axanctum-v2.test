@@ -97,6 +97,43 @@ def _is_long_allowed_by_regime(r: Dict, allowed_setups: List[str]) -> bool:
     return bool(set(setups) & set(allowed_setups))
 
 
+def _has_bearish_breadth_recovery_exception(r: Dict) -> bool:
+    """
+    Recovery long di breadth bearish tetap boleh, tapi hanya sebagai
+    reversal/momentum setup dengan bukti microstructure kuat.
+    """
+    setups = set(r.get("long_setups") or _classify_long_setups(r))
+    if not setups & {"extreme_reversal", "momentum_ignition"}:
+        return False
+
+    flags = set(r.get("flags", []))
+    d_vwap = float(r.get("d_vwap", 0.0))
+    price24 = float(r.get("price_change_24h", 0.0))
+    delta_cvd_spot = float(r.get("delta_cvd_spot", 0.0))
+    delta_cvd_fut = float(r.get("delta_cvd_fut", 0.0))
+    squeeze_fuel = float(r.get("squeeze_fuel", 0.0))
+    squeeze_type = r.get("squeeze_type", "none")
+    vol_ratio = float(r.get("vol_ratio", 1.0))
+
+    cvd_recovery = (
+        delta_cvd_spot > 1.0
+        or (
+            delta_cvd_spot >= 0.0
+            and delta_cvd_fut > 2.0
+            and "A_FUTURES" in flags
+        )
+        or "CONFLUENCE" in flags
+    )
+    squeeze_reversal = (
+        squeeze_type in ("short", "short_exhausted", "none")
+        and ("C_SQUEEZE" in flags or squeeze_fuel >= 45.0)
+    )
+    clean_location = d_vwap <= 2.5 and price24 <= 6.0
+    volume_ok = vol_ratio >= 0.8
+
+    return bool(cvd_recovery and squeeze_reversal and clean_location and volume_ok)
+
+
 async def scan_coin(
     session:   aiohttp.ClientSession,
     symbol:    str,
@@ -158,6 +195,11 @@ async def scan_coin(
             # ── Short-term Price Momentum (5 candle terakhir) ──────────
             delta_price_short = calc_price_momentum(fut_df, 5)
 
+            # ── 24h Candle Direction ───────────────────────────────────
+            tf_min = TF_MINUTES.get(CONFIG["TIMEFRAME"], 60)
+            candles_24h = max(1, int(round(1440 / max(tf_min, 1))))
+            price_change_24h = calc_price_momentum(fut_df, candles_24h)
+
             # ── Funding Rate & Velocity ────────────────────────────────
             fr = _raw_fr if _raw_fr is not None else 0.0
 
@@ -177,7 +219,6 @@ async def scan_coin(
                     fr_velocity = fr - prev_fr  # gunakan data lama, tidak update dulu
 
             # ── FORECAST ENGINE ────────────────────────────────────────
-            tf_min = TF_MINUTES.get(CONFIG["TIMEFRAME"], 60)
             vol_ratio, vol_label = calc_volume_anomaly(fut_df, N, tf_min)
 
             # ── Flag: short-term momentum sudah berbalik ───────────────
@@ -333,6 +374,7 @@ async def scan_coin(
                 "delta_cvd_fut":  delta_cvd_fut,
                 "delta_oi":       delta_oi,
                 "delta_price":    delta_price,
+                "price_change_24h": price_change_24h,
                 "funding_rate":   fr,
                 "score":          score,
                 "grade":          grade,
@@ -534,6 +576,54 @@ async def run_scan_batch(
         short_threshold=_short_threshold,
     )
 
+    _base_long_threshold = _long_threshold
+    _base_short_threshold = _short_threshold
+    _breadth_allowed_long_setups = set(_LONG_SETUP_TYPES)
+    _breadth_force_short_ok = False
+
+    if breadth_ctx.long_mode == "blocked":
+        _long_threshold = max(_long_threshold + 14.0, CONFIG["MIN_SCORE"] + 18.0)
+        _short_threshold = max(CONFIG["MIN_SCORE"], _short_threshold - 6.0)
+        _breadth_allowed_long_setups = {"extreme_reversal"}
+        _breadth_force_short_ok = True
+    elif breadth_ctx.long_mode == "restricted":
+        _long_threshold = max(_long_threshold + 8.0, CONFIG["MIN_SCORE"] + 10.0)
+        _short_threshold = max(CONFIG["MIN_SCORE"], _short_threshold - 4.0)
+        _breadth_allowed_long_setups = {"extreme_reversal", "momentum_ignition"}
+        _breadth_force_short_ok = True
+    elif breadth_ctx.long_mode == "cautious":
+        _long_threshold = max(_long_threshold + 4.0, CONFIG["MIN_SCORE"] + 4.0)
+        _short_threshold = max(CONFIG["MIN_SCORE"], _short_threshold - 2.0)
+        _breadth_allowed_long_setups = {
+            "breakout", "pullback", "accumulation_long",
+            "extreme_reversal", "momentum_ignition",
+        }
+        _breadth_force_short_ok = True
+    elif breadth_ctx.short_mode in ("favored", "aggressive"):
+        _short_threshold = max(CONFIG["MIN_SCORE"], _short_threshold - 2.0)
+        _breadth_force_short_ok = True
+
+    if (
+        _long_threshold != _base_long_threshold
+        or _short_threshold != _base_short_threshold
+    ):
+        log.info(
+            f"[BreadthOverlay] bias={breadth_ctx.direction} "
+            f"strength={breadth_ctx.strength:.2f} conf={breadth_ctx.confirmations} | "
+            f"long_thr {_base_long_threshold:.1f}->{_long_threshold:.1f} "
+            f"short_thr {_base_short_threshold:.1f}->{_short_threshold:.1f} | "
+            f"long_mode={breadth_ctx.long_mode} short_mode={breadth_ctx.short_mode}"
+        )
+
+    breadth_ctx = calculate_market_breadth(
+        results=results,
+        long_threshold=_long_threshold,
+        short_threshold=_short_threshold,
+    )
+
+    if _breadth_force_short_ok:
+        _short_setups_ok = True
+
     log.info(
         f"[Regime] Gate — long_ok={_long_setups_ok} | short_ok={_short_setups_ok}"
     )
@@ -546,6 +636,11 @@ async def run_scan_batch(
     _setup_allowed_long_candidates = [
         r for r in _raw_long_candidates
         if _is_long_allowed_by_regime(r, regime_ctx.allowed_setups)
+        and bool(set(r.get("long_setups", [])) & _breadth_allowed_long_setups)
+        and (
+            breadth_ctx.long_mode not in ("restricted", "blocked")
+            or _has_bearish_breadth_recovery_exception(r)
+        )
     ]
     _setup_blocked_long = len(_raw_long_candidates) - len(_setup_allowed_long_candidates)
     if _raw_long_candidates:
