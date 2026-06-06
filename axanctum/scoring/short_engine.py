@@ -459,6 +459,36 @@ def calc_integrated_short_score(
             _add_unique(exhaustion_flags, "D_EXHAUSTION")
         setup_scores.append(("exhaustion_after_pump_short", exhaustion_score, exhaustion_flags, exhaustion_contexts))
 
+    # ── 5b) Top reversal: tren naik masih berjalan, tapi pucuk rapuh ───
+    top_reversal_context = (
+        (price_change_24h >= 5.0 or delta_price >= 2.0 or d_vwap >= 4.0)
+        and d_vwap >= 2.0
+    )
+    top_flow_break = delta_cvd_spot < -1.0 and delta_cvd_fut < 1.5
+    top_deriv_heat = funding_hot or oi_hot or dist_score >= 55.0 or div_score >= 45.0
+    if top_reversal_context and top_flow_break and top_deriv_heat:
+        top_score = 42.0
+        top_score += min(max(d_vwap, 0.0) / 8.0, 1.0) * 12.0
+        top_score += min(max(price_change_24h, delta_price, 0.0) / 12.0, 1.0) * 10.0
+        top_flags = ["TOP_REVERSAL_SHORT"]
+        top_contexts = [
+            f"🎯 Top reversal: pump/premium mulai rapuh "
+            f"(24h {price_change_24h:+.1f}%, VWAP {d_vwap:+.1f}%)"
+        ]
+        if delta_cvd_spot < -1.0:
+            top_score += 8.0
+            _add_unique(top_flags, "DIV_HIDDEN_DIST")
+        if funding_hot or oi_hot:
+            top_score += 8.0
+            _add_unique(top_flags, "D_EXHAUSTION")
+        if dist_score > 0:
+            top_score += min(dist_score * 0.25, 14.0)
+            _extend_unique(top_flags, dist_flags)
+        if div_score > 0:
+            top_score += min(div_score * 0.25, 14.0)
+            _extend_unique(top_flags, div_flags)
+        setup_scores.append(("top_reversal_short", top_score, top_flags, top_contexts))
+
     # ── 6) Bearish divergence: harga belum jatuh tapi flow sudah rusak ─
     if div_score > 0:
         divergence_score = div_score

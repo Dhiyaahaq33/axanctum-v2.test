@@ -506,6 +506,7 @@ def calc_price_targets(
             "DISTRIBUTION_SHORT",
             "BEARISH_DIVERGENCE_SHORT",
             "EXHAUSTION_AFTER_PUMP_SHORT",
+            "TOP_REVERSAL_SHORT",
         ]
     ):
         targets["direction"] = "SHORT — Distribution / Exhaustion"

@@ -134,6 +134,180 @@ def _has_bearish_breadth_recovery_exception(r: Dict) -> bool:
     return bool(cvd_recovery and squeeze_reversal and clean_location and volume_ok)
 
 
+def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[str]]:
+    """
+    Quality gate akhir untuk SHORT alert.
+
+    short_score tetap boleh tinggi sebagai detector, tapi Telegram hanya kirim
+    kalau setup punya edge mandiri: flow, derivatif, freshness, atau top signal.
+    """
+    reasons: List[str] = []
+    setups = set(r.get("short_setups", []))
+    flags = set(r.get("short_flags", []))
+
+    price24 = float(r.get("price_change_24h", 0.0))
+    delta_price = float(r.get("delta_price", 0.0))
+    d_vwap = float(r.get("d_vwap", 0.0))
+    delta_price_short = float(r.get("delta_price_short", 0.0))
+    delta_cvd_spot = float(r.get("delta_cvd_spot", 0.0))
+    delta_cvd_fut = float(r.get("delta_cvd_fut", 0.0))
+    delta_oi = float(r.get("delta_oi", 0.0))
+    funding_rate = float(r.get("funding_rate", 0.0))
+    vol_ratio = float(r.get("vol_ratio", 1.0))
+    ls_score = float(r.get("ls_score", 0.0))
+    dist_score = float(r.get("dist_score", 0.0))
+    div_score = float(r.get("div_score", 0.0))
+
+    top_setups = {
+        "top_reversal_short",
+        "exhaustion_after_pump_short",
+        "distribution_short",
+        "bearish_divergence_short",
+    }
+    trend_setups = {
+        "bear_continuation_short",
+        "breakdown_short",
+        "long_squeeze_short",
+    }
+
+    both_bearish = delta_cvd_spot < -1.0 and delta_cvd_fut < -1.0
+    strong_bear_flow = (
+        delta_cvd_spot <= -2.5 and delta_cvd_fut <= -1.5
+    ) or (delta_cvd_spot + delta_cvd_fut <= -6.0)
+    weak_bear_flow = delta_cvd_spot < -1.0 or delta_cvd_fut < -1.0
+    bullish_conflict = (
+        delta_cvd_spot > 2.0 and delta_cvd_fut > 1.5
+    ) or (
+        delta_cvd_spot > 4.0 and delta_cvd_fut >= 0.0
+    )
+
+    funding_trapped_long = funding_rate > 0.0001 and delta_price <= 0
+    oi_hot_breakdown = delta_oi > 4.0 and (
+        "breakdown_short" in setups or delta_price_short <= -0.8
+    )
+    long_squeeze_active = "long_squeeze_short" in setups and ls_score >= 55.0
+    deriv_edge = (
+        strong_bear_flow
+        or long_squeeze_active
+        or funding_trapped_long
+        or oi_hot_breakdown
+        or dist_score >= 72.0
+        or div_score >= 72.0
+    )
+
+    late_entry = price24 <= -14.0 and d_vwap <= -7.0
+    extreme_late = price24 <= -20.0 or d_vwap <= -11.0
+    exhausted_deriv = (
+        delta_oi <= -8.0
+        and funding_rate <= 0.0
+        and not funding_trapped_long
+    )
+    active_late_edge = (
+        long_squeeze_active
+        or funding_trapped_long
+        or oi_hot_breakdown
+        or (strong_bear_flow and delta_oi > -6.0)
+    )
+
+    top_context = price24 >= 3.0 or delta_price >= 1.2 or d_vwap >= 3.0
+    top_flow = (
+        delta_cvd_spot < -1.0 and delta_cvd_fut < 1.0
+    ) or div_score >= 50.0 or dist_score >= 55.0
+    top_deriv = (
+        funding_rate > 0.0005
+        or delta_oi > 4.0
+        or dist_score >= 70.0
+        or div_score >= 70.0
+    )
+    top_valid = bool(
+        setups & top_setups
+        and top_context
+        and top_flow
+        and (top_deriv or strong_bear_flow)
+        and vol_ratio >= 0.7
+    )
+
+    trend_context = breadth_ctx.direction in ("BEARISH_CONFIRMED", "RISK_OFF", "BEARISH_WEAK")
+    breakdown_fresh = (
+        "breakdown_short" in setups
+        and -8.0 <= price24 <= 2.0
+        and -5.0 <= d_vwap <= -0.4
+        and delta_price_short <= -0.8
+    )
+    bear_continuation_valid = bool(
+        setups & trend_setups
+        and trend_context
+        and deriv_edge
+        and weak_bear_flow
+        and vol_ratio >= 0.7
+    )
+
+    # Distribution dari area bawah bukan top alert; dia hanya memperkuat continuation.
+    deep_distribution = (
+        "distribution_short" in setups
+        and price24 <= -10.0
+        and d_vwap <= -5.0
+        and not top_valid
+    )
+
+    if bullish_conflict:
+        return "blocked", ["bullish_cvd_conflict"]
+
+    if regime_ctx.regime == "PANIC":
+        return "blocked", ["panic_suspended"]
+
+    if deep_distribution:
+        reasons.append("distribution_not_top")
+
+    if late_entry and not active_late_edge:
+        reasons.append("late_entry")
+        if extreme_late or exhausted_deriv:
+            return "watch", reasons + ["exhausted_deriv"]
+        return "watch", reasons
+
+    if extreme_late and not active_late_edge:
+        return "watch", ["extreme_late"]
+
+    if regime_ctx.regime == "RECOVERY":
+        if top_valid and (dist_score >= 75.0 or div_score >= 75.0):
+            return "alert", ["top_reversal_valid", "recovery_exception"]
+        if long_squeeze_active and funding_trapped_long and strong_bear_flow:
+            return "alert", ["long_squeeze_valid", "recovery_exception"]
+        return "watch", ["regime_recovery_strict"]
+
+    if regime_ctx.regime == "CHOP":
+        if top_valid:
+            return "alert", ["top_reversal_valid"]
+        if breakdown_fresh and deriv_edge and weak_bear_flow:
+            return "alert", ["breakdown_fresh"]
+        return "watch", ["chop_needs_breakdown_or_top"]
+
+    if top_valid:
+        return "alert", ["top_reversal_valid"]
+
+    if "bear_continuation_short" in setups and not deriv_edge:
+        return "watch", ["no_deriv_edge"]
+
+    if "bear_continuation_short" in setups and not both_bearish and not long_squeeze_active:
+        return "watch", ["weak_flow"]
+
+    if bear_continuation_valid:
+        if late_entry:
+            return "alert", ["bear_continuation_valid", "late_deriv_exception"]
+        return "alert", ["bear_continuation_valid"]
+
+    if breakdown_fresh and deriv_edge:
+        return "alert", ["breakdown_fresh"]
+
+    if long_squeeze_active and (weak_bear_flow or funding_trapped_long):
+        return "alert", ["long_squeeze_valid"]
+
+    if setups & top_setups:
+        return "watch", ["top_setup_unconfirmed"]
+
+    return "watch", reasons or ["quality_gate_watch"]
+
+
 async def scan_coin(
     session:   aiohttp.ClientSession,
     symbol:    str,
@@ -417,6 +591,7 @@ async def scan_coin(
                 "delta_cvd_fut":  delta_cvd_fut,
                 "delta_oi":       delta_oi,
                 "delta_price":    delta_price,
+                "delta_price_short": delta_price_short,
                 "price_change_24h": price_change_24h,
                 "funding_rate":   fr,
                 "score":          score,
@@ -617,6 +792,7 @@ async def run_scan_batch(
 
         if regime_ctx.regime == "EUPHORIC":
             if short_setups & {
+                "top_reversal_short",
                 "exhaustion_after_pump_short",
                 "bearish_divergence_short",
                 "distribution_short",
@@ -650,12 +826,12 @@ async def run_scan_batch(
         "bear_continuation_short", "breakdown_short",
         "long_squeeze_short", "distribution_short",
         "bearish_divergence_short", "exhaustion_after_pump_short",
+        "top_reversal_short",
     }
     _long_setups_ok  = bool(_LONG_SETUP_TYPES  & set(regime_ctx.allowed_setups))
-    _short_setups_ok = (
-        bool(_SHORT_SETUP_TYPES & set(regime_ctx.allowed_setups))
-        or _pre_euphoric_guard
-    )
+    # SHORT boleh dievaluasi di semua regime non-PANIC; keketatannya diatur
+    # oleh _short_gate_decision, bukan hard-block regime allowed_setups.
+    _short_setups_ok = regime_ctx.risk_profile != "suspended"
 
     breadth_ctx = calculate_market_breadth(
         results=results,
@@ -671,24 +847,24 @@ async def run_scan_batch(
 
     if breadth_ctx.long_mode == "blocked":
         _long_threshold = max(_long_threshold + 14.0, CONFIG["MIN_SCORE"] + 18.0)
-        _short_threshold = max(CONFIG["MIN_SCORE"], _short_threshold - 6.0)
+        _short_threshold = max(CONFIG["MIN_SCORE"] + 10.0, _short_threshold - 2.0)
         _breadth_allowed_long_setups = {"extreme_reversal"}
         _breadth_force_short_ok = True
     elif breadth_ctx.long_mode == "restricted":
         _long_threshold = max(_long_threshold + 8.0, CONFIG["MIN_SCORE"] + 10.0)
-        _short_threshold = max(CONFIG["MIN_SCORE"], _short_threshold - 4.0)
+        _short_threshold = max(CONFIG["MIN_SCORE"] + 8.0, _short_threshold - 1.0)
         _breadth_allowed_long_setups = {"extreme_reversal", "momentum_ignition"}
         _breadth_force_short_ok = True
     elif breadth_ctx.long_mode == "cautious":
         _long_threshold = max(_long_threshold + 4.0, CONFIG["MIN_SCORE"] + 4.0)
-        _short_threshold = max(CONFIG["MIN_SCORE"], _short_threshold - 2.0)
+        _short_threshold = max(CONFIG["MIN_SCORE"] + 6.0, _short_threshold - 1.0)
         _breadth_allowed_long_setups = {
             "breakout", "pullback", "accumulation_long",
             "extreme_reversal", "momentum_ignition",
         }
         _breadth_force_short_ok = True
     elif breadth_ctx.short_mode in ("favored", "aggressive"):
-        _short_threshold = max(CONFIG["MIN_SCORE"], _short_threshold - 2.0)
+        _short_threshold = max(CONFIG["MIN_SCORE"] + 6.0, _short_threshold - 1.0)
         _breadth_force_short_ok = True
     elif breadth_ctx.short_mode == "cautious":
         _short_threshold = max(_short_threshold + 4.0, CONFIG["MIN_SCORE"] + 6.0)
@@ -696,6 +872,7 @@ async def run_scan_batch(
             "exhaustion_short", "fade_top",
             "long_squeeze_short", "distribution_short",
             "bearish_divergence_short", "exhaustion_after_pump_short",
+            "top_reversal_short",
         }
 
     if (
@@ -719,9 +896,9 @@ async def run_scan_batch(
         breadth_adj = 0.0
 
         if breadth_ctx.short_mode == "aggressive":
-            breadth_adj += 6.0
+            breadth_adj += 3.0
         elif breadth_ctx.short_mode == "favored":
-            breadth_adj += 4.0
+            breadth_adj += 2.0
         elif breadth_ctx.short_mode == "cautious":
             breadth_adj -= 5.0
 
@@ -735,7 +912,7 @@ async def run_scan_batch(
             breadth_ctx.direction in ("BEARISH_CONFIRMED", "RISK_OFF")
             and setups & {"bear_continuation_short", "breakdown_short", "long_squeeze_short"}
         ):
-            breadth_adj += 3.0
+            breadth_adj += 1.0
 
         r["short_score_regime_adj"] = round(
             max(0.0, min(100.0, short_score_adj + breadth_adj)),
@@ -803,6 +980,38 @@ async def run_scan_batch(
         f"blocked={_setup_blocked_short} | {_short_setup_summary}"
     )
 
+    _quality_alert_short_candidates = []
+    _quality_watch_short_candidates = []
+    _quality_blocked_short_candidates = []
+    _short_gate_reason_counts: Dict[str, int] = {}
+
+    for r in _setup_allowed_short_candidates:
+        status, reasons = _short_gate_decision(r, regime_ctx, breadth_ctx)
+        r["short_gate_status"] = status
+        r["short_gate_reasons"] = reasons
+
+        for reason in reasons:
+            _short_gate_reason_counts[reason] = _short_gate_reason_counts.get(reason, 0) + 1
+
+        if status == "alert":
+            _quality_alert_short_candidates.append(r)
+        elif status == "blocked":
+            _quality_blocked_short_candidates.append(r)
+        else:
+            _quality_watch_short_candidates.append(r)
+
+    _reason_summary = " ".join(
+        f"{reason}={count}"
+        for reason, count in sorted(_short_gate_reason_counts.items())
+    ) or "none"
+    log.info(
+        f"[ShortGate] raw={len(_setup_allowed_short_candidates)} | "
+        f"alert={len(_quality_alert_short_candidates)} | "
+        f"watch={len(_quality_watch_short_candidates)} | "
+        f"blocked={len(_quality_blocked_short_candidates)} | "
+        f"reasons: {_reason_summary}"
+    )
+
     alerts = [
         r for r in _setup_allowed_long_candidates
         if _long_setups_ok
@@ -815,7 +1024,7 @@ async def run_scan_batch(
     alerts.sort(key=lambda x: x.get("score_regime_adj", x["score"]), reverse=True)
 
     short_alerts = [
-        r for r in _setup_allowed_short_candidates
+        r for r in _quality_alert_short_candidates
         if _short_setups_ok
     ]
     short_alerts.sort(
@@ -899,9 +1108,10 @@ async def run_scan_batch(
             _mark_sent(sym, "SHORT")
 
         setups = ",".join(r.get("short_setups", [])) or "short"
+        reasons = ",".join(r.get("short_gate_reasons", [])) or "gate_ok"
         log.info(
             f"  📤 {sym:<18} [SHORT] "
-            f"score={short_score:5.1f} setups={setups} → "
+            f"score={short_score:5.1f} setups={setups} gate={reasons} → "
             f"{'✓ terkirim' if ok else '✗ gagal'}"
         )
 
