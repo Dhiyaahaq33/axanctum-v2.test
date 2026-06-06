@@ -45,6 +45,75 @@ from .scoring.short_engine import (
 from .state import _FR_HISTORY_4H, _FR_VELOCITY_INTERVAL
 
 
+def _calc_short_execution_state(fut_df, candles_24h: int) -> Dict:
+    """
+    Proxy trigger eksekusi SHORT dari candle yang sudah tersedia.
+
+    Ini bukan penentu arah utama. Fungsinya membedakan area resistance
+    yang baru "rawan" dari resistance yang mulai gagal/reject.
+    """
+    state = {
+        "short_rejection_score": 0.0,
+        "failed_breakout": False,
+        "last_candle_bearish": False,
+        "last_close_position": 0.5,
+        "upper_wick_pct": 0.0,
+        "near_24h_high": False,
+    }
+
+    if fut_df is None or len(fut_df) < 3:
+        return state
+
+    last = fut_df.iloc[-1]
+    open_ = float(last["open"])
+    close = float(last["close"])
+    high = float(last["high"])
+    low = float(last["low"])
+    if close <= 0 or high <= low:
+        return state
+
+    range_abs = high - low
+    range_pct = range_abs / close * 100.0
+    upper_wick_pct = max(0.0, high - max(open_, close)) / close * 100.0
+    lower_wick_pct = max(0.0, min(open_, close) - low) / close * 100.0
+    close_position = (close - low) / range_abs if range_abs > 0 else 0.5
+    last_candle_bearish = close < open_
+
+    lookback = max(3, min(candles_24h, len(fut_df) - 1))
+    prev_tail = fut_df.iloc[-lookback - 1:-1]
+    prev_high = float(prev_tail["high"].max()) if len(prev_tail) else high
+    near_24h_high = bool(prev_high > 0 and (high >= prev_high * 0.995 or close >= prev_high * 0.99))
+    failed_breakout = bool(prev_high > 0 and high > prev_high * 1.001 and close < prev_high * 0.998)
+
+    rejection_score = 0.0
+    if last_candle_bearish:
+        rejection_score += 18.0
+    if close_position <= 0.42:
+        rejection_score += 18.0
+    elif close_position <= 0.58:
+        rejection_score += 9.0
+    if range_pct > 0:
+        upper_ratio = upper_wick_pct / range_pct
+        if upper_wick_pct >= 0.25 and upper_ratio >= 0.30:
+            rejection_score += min(upper_ratio * 35.0, 25.0)
+    if failed_breakout:
+        rejection_score += 30.0
+    elif near_24h_high and upper_wick_pct >= 0.35 and close_position <= 0.60:
+        rejection_score += 14.0
+    if range_pct >= 0.5 and upper_wick_pct > lower_wick_pct:
+        rejection_score += 8.0
+
+    state.update({
+        "short_rejection_score": round(min(rejection_score, 100.0), 1),
+        "failed_breakout": failed_breakout,
+        "last_candle_bearish": last_candle_bearish,
+        "last_close_position": round(close_position, 3),
+        "upper_wick_pct": round(upper_wick_pct, 3),
+        "near_24h_high": near_24h_high,
+    })
+    return state
+
+
 def _classify_long_setups(r: Dict) -> List[str]:
     """
     Klasifikasikan setup LONG aktual dari hasil scan.
@@ -157,6 +226,11 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
     ls_score = float(r.get("ls_score", 0.0))
     dist_score = float(r.get("dist_score", 0.0))
     div_score = float(r.get("div_score", 0.0))
+    short_rejection_score = float(r.get("short_rejection_score", 0.0))
+    failed_breakout = bool(r.get("failed_breakout", False))
+    last_candle_bearish = bool(r.get("last_candle_bearish", False))
+    last_close_position = float(r.get("last_close_position", 0.5))
+    near_24h_high = bool(r.get("near_24h_high", False))
 
     top_setups = {
         "top_reversal_short",
@@ -210,6 +284,28 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
     )
 
     top_context = price24 >= 3.0 or delta_price >= 1.2 or d_vwap >= 3.0
+    rejection_confirmed = (
+        short_rejection_score >= 55.0
+        or failed_breakout
+        or (
+            last_candle_bearish
+            and last_close_position <= 0.55
+            and delta_price_short <= -0.35
+            and weak_bear_flow
+        )
+    )
+    breakout_risk = (
+        top_context
+        and d_vwap >= 1.5
+        and delta_price_short >= 0.4
+        and delta_cvd_fut >= 1.0
+        and not rejection_confirmed
+    ) or (
+        last_close_position >= 0.70
+        and delta_price_short > 0
+        and not last_candle_bearish
+        and not rejection_confirmed
+    )
     top_flow = (
         delta_cvd_spot < -1.0 and delta_cvd_fut < 1.0
     ) or div_score >= 50.0 or dist_score >= 55.0
@@ -222,6 +318,7 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
     top_valid = bool(
         setups & top_setups
         and top_context
+        and rejection_confirmed
         and top_flow
         and (top_deriv or strong_bear_flow)
         and vol_ratio >= 0.7
@@ -253,6 +350,9 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
     if bullish_conflict:
         return "blocked", ["bullish_cvd_conflict"]
 
+    if breakout_risk and setups & top_setups:
+        return "watch", ["breakout_risk_no_rejection"]
+
     if regime_ctx.regime == "PANIC":
         return "blocked", ["panic_suspended"]
 
@@ -283,7 +383,8 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
         return "watch", ["chop_needs_breakdown_or_top"]
 
     if top_valid:
-        return "alert", ["top_reversal_valid"]
+        reason = "failed_breakout" if failed_breakout else "top_reversal_valid"
+        return "alert", [reason]
 
     if "bear_continuation_short" in setups and not deriv_edge:
         return "watch", ["no_deriv_edge"]
@@ -292,6 +393,8 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
         return "watch", ["weak_flow"]
 
     if bear_continuation_valid:
+        if near_24h_high and not both_bearish and not long_squeeze_active:
+            return "watch", ["near_high_needs_stronger_flow"]
         if late_entry:
             return "alert", ["bear_continuation_valid", "late_deriv_exception"]
         return "alert", ["bear_continuation_valid"]
@@ -373,6 +476,7 @@ async def scan_coin(
             tf_min = TF_MINUTES.get(CONFIG["TIMEFRAME"], 60)
             candles_24h = max(1, int(round(1440 / max(tf_min, 1))))
             price_change_24h = calc_price_momentum(fut_df, candles_24h)
+            short_execution = _calc_short_execution_state(fut_df, candles_24h)
 
             # ── Funding Rate & Velocity ────────────────────────────────
             fr = _raw_fr if _raw_fr is not None else 0.0
@@ -529,6 +633,12 @@ async def scan_coin(
                 div_score         = div_score,
                 div_flags         = div_flags,
                 div_contexts      = div_contexts,
+                short_rejection_score = short_execution["short_rejection_score"],
+                failed_breakout       = short_execution["failed_breakout"],
+                last_candle_bearish   = short_execution["last_candle_bearish"],
+                last_close_position   = short_execution["last_close_position"],
+                upper_wick_pct        = short_execution["upper_wick_pct"],
+                near_24h_high         = short_execution["near_24h_high"],
             )
 
             if short_score > 0:
@@ -631,6 +741,12 @@ async def scan_coin(
                 "short_contexts": short_contexts,
                 "short_setups":   short_setups,
                 "short_targets":  short_targets,
+                "short_rejection_score": short_execution["short_rejection_score"],
+                "failed_breakout":       short_execution["failed_breakout"],
+                "last_candle_bearish":   short_execution["last_candle_bearish"],
+                "last_close_position":   short_execution["last_close_position"],
+                "upper_wick_pct":        short_execution["upper_wick_pct"],
+                "near_24h_high":         short_execution["near_24h_high"],
             }
         except asyncio.CancelledError:
             raise
@@ -847,24 +963,24 @@ async def run_scan_batch(
 
     if breadth_ctx.long_mode == "blocked":
         _long_threshold = max(_long_threshold + 14.0, CONFIG["MIN_SCORE"] + 18.0)
-        _short_threshold = max(CONFIG["MIN_SCORE"] + 10.0, _short_threshold - 2.0)
+        _short_threshold = max(_short_threshold, CONFIG["MIN_SCORE"] + 12.0)
         _breadth_allowed_long_setups = {"extreme_reversal"}
         _breadth_force_short_ok = True
     elif breadth_ctx.long_mode == "restricted":
         _long_threshold = max(_long_threshold + 8.0, CONFIG["MIN_SCORE"] + 10.0)
-        _short_threshold = max(CONFIG["MIN_SCORE"] + 8.0, _short_threshold - 1.0)
+        _short_threshold = max(_short_threshold, CONFIG["MIN_SCORE"] + 10.0)
         _breadth_allowed_long_setups = {"extreme_reversal", "momentum_ignition"}
         _breadth_force_short_ok = True
     elif breadth_ctx.long_mode == "cautious":
         _long_threshold = max(_long_threshold + 4.0, CONFIG["MIN_SCORE"] + 4.0)
-        _short_threshold = max(CONFIG["MIN_SCORE"] + 6.0, _short_threshold - 1.0)
+        _short_threshold = max(_short_threshold, CONFIG["MIN_SCORE"] + 8.0)
         _breadth_allowed_long_setups = {
             "breakout", "pullback", "accumulation_long",
             "extreme_reversal", "momentum_ignition",
         }
         _breadth_force_short_ok = True
     elif breadth_ctx.short_mode in ("favored", "aggressive"):
-        _short_threshold = max(CONFIG["MIN_SCORE"] + 6.0, _short_threshold - 1.0)
+        _short_threshold = max(_short_threshold, CONFIG["MIN_SCORE"] + 8.0)
         _breadth_force_short_ok = True
     elif breadth_ctx.short_mode == "cautious":
         _short_threshold = max(_short_threshold + 4.0, CONFIG["MIN_SCORE"] + 6.0)
@@ -895,10 +1011,18 @@ async def run_scan_batch(
         setups = set(r.get("short_setups", []))
         breadth_adj = 0.0
 
-        if breadth_ctx.short_mode == "aggressive":
-            breadth_adj += 3.0
-        elif breadth_ctx.short_mode == "favored":
+        if breadth_ctx.short_mode == "aggressive" and setups & {
+            "bear_continuation_short",
+            "breakdown_short",
+            "long_squeeze_short",
+        }:
             breadth_adj += 2.0
+        elif breadth_ctx.short_mode == "favored" and setups & {
+            "bear_continuation_short",
+            "breakdown_short",
+            "long_squeeze_short",
+        }:
+            breadth_adj += 1.0
         elif breadth_ctx.short_mode == "cautious":
             breadth_adj -= 5.0
 
@@ -912,7 +1036,7 @@ async def run_scan_batch(
             breadth_ctx.direction in ("BEARISH_CONFIRMED", "RISK_OFF")
             and setups & {"bear_continuation_short", "breakdown_short", "long_squeeze_short"}
         ):
-            breadth_adj += 1.0
+            breadth_adj += 0.5
 
         r["short_score_regime_adj"] = round(
             max(0.0, min(100.0, short_score_adj + breadth_adj)),

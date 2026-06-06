@@ -32,6 +32,7 @@ def _cap_short_score(
     dist_score: float,
     div_score: float,
     ls_score: float,
+    rejection_confirmed: bool,
 ) -> tuple[float, str | None]:
     """Batasi confidence score agar detector tidak otomatis menjadi PRIME."""
     both_bearish = delta_cvd_spot < -1.0 and delta_cvd_fut < -1.0
@@ -48,6 +49,7 @@ def _cap_short_score(
         and price_change_24h >= 5.0
         and delta_cvd_spot <= -2.0
         and delta_cvd_fut <= 1.0
+        and rejection_confirmed
         and (funding_rate > 0.0008 or oi_hot)
         and (dist_score >= 70.0 or div_score >= 60.0)
         and vol_ratio >= 1.0
@@ -421,6 +423,12 @@ def calc_integrated_short_score(
     div_score: float,
     div_flags: List[str],
     div_contexts: List[str],
+    short_rejection_score: float = 0.0,
+    failed_breakout: bool = False,
+    last_candle_bearish: bool = False,
+    last_close_position: float = 0.5,
+    upper_wick_pct: float = 0.0,
+    near_24h_high: bool = False,
 ) -> Tuple[float, List[str], List[str], List[str]]:
     """
     Integrated SHORT decision branch.
@@ -439,6 +447,32 @@ def calc_integrated_short_score(
     oi_hot = delta_oi > 4.0
     oi_deleveraging = delta_oi < -2.0
     below_vwap = d_vwap < 0
+    strong_bear_flow = (
+        delta_cvd_spot <= -2.5 and delta_cvd_fut <= -1.5
+    ) or (delta_cvd_spot + delta_cvd_fut <= -6.0)
+    rejection_confirmed = (
+        short_rejection_score >= 55.0
+        or failed_breakout
+        or (
+            last_candle_bearish
+            and last_close_position <= 0.55
+            and delta_price_short <= -0.35
+            and any_cvd_bearish
+        )
+    )
+    soft_rejection = rejection_confirmed or short_rejection_score >= 38.0
+    bullish_breakout_risk = (
+        price_change_24h >= 3.0
+        and d_vwap >= 1.5
+        and delta_price_short >= 0.4
+        and delta_cvd_fut >= 1.0
+        and not rejection_confirmed
+    ) or (
+        last_close_position >= 0.70
+        and delta_price_short > 0
+        and not last_candle_bearish
+        and not rejection_confirmed
+    )
 
     # ── 1) Bear continuation: cocok untuk tape bearish sepanjang hari ──
     bear_score = 0.0
@@ -517,7 +551,13 @@ def calc_integrated_short_score(
         setup_scores.append(("long_squeeze_short", squeeze_score, squeeze_flags, squeeze_contexts))
 
     # ── 4) Distribution: smart money jual saat market belum sadar ──────
-    if dist_score > 0:
+    distribution_confirmed = (
+        delta_price <= 0.0
+        or delta_price_short <= -0.35
+        or rejection_confirmed
+        or strong_bear_flow
+    )
+    if dist_score > 0 and distribution_confirmed:
         distribution_score = dist_score
         distribution_flags = ["DISTRIBUTION_SHORT"]
         distribution_contexts = list(dist_contexts)
@@ -528,18 +568,30 @@ def calc_integrated_short_score(
             distribution_score += 6.0
         if funding_positive:
             distribution_score += 4.0
+        if rejection_confirmed:
+            distribution_score += 5.0
+            _add_unique(distribution_flags, "SHORT_REJECTION_CONFIRMED")
+            distribution_contexts.append(
+                f"🧱 Rejection terkonfirmasi — skor {short_rejection_score:.0f}/100"
+            )
         setup_scores.append(("distribution_short", distribution_score, distribution_flags, distribution_contexts))
 
     # ── 5) Exhaustion after pump: fade pucuk, bukan trend-follow short ──
     pumpish = price_change_24h >= 3.0 or delta_price >= 1.2 or d_vwap >= 3.0
     exhaustion_evidence = dist_score > 0 or div_score > 0 or delta_cvd_spot < -1.0 or delta_cvd_fut < -1.0
-    if pumpish and exhaustion_evidence:
+    if pumpish and exhaustion_evidence and soft_rejection:
         pump_ref = max(price_change_24h, delta_price, d_vwap)
         exhaustion_score = 26.0 + min(max(pump_ref, 0.0) / 8.0, 1.0) * 12.0
         exhaustion_flags = ["EXHAUSTION_AFTER_PUMP_SHORT"]
         exhaustion_contexts = [
             f"🪫 Exhaustion after pump: 24h {price_change_24h:+.1f}% VWAP {d_vwap:+.1f}%"
         ]
+        if rejection_confirmed:
+            exhaustion_score += 6.0
+            _add_unique(exhaustion_flags, "SHORT_REJECTION_CONFIRMED")
+            exhaustion_contexts.append(
+                f"🧱 Candle/failed breakout confirm — rejection {short_rejection_score:.0f}/100"
+            )
         if dist_score > 0:
             exhaustion_score += min(dist_score * 0.25, 12.0)
             _extend_unique(exhaustion_flags, dist_flags)
@@ -558,7 +610,7 @@ def calc_integrated_short_score(
     )
     top_flow_break = delta_cvd_spot < -1.0 and delta_cvd_fut < 1.5
     top_deriv_heat = funding_hot or oi_hot or dist_score >= 55.0 or div_score >= 45.0
-    if top_reversal_context and top_flow_break and top_deriv_heat:
+    if top_reversal_context and top_flow_break and top_deriv_heat and rejection_confirmed:
         top_score = 36.0
         top_score += min(max(d_vwap, 0.0) / 8.0, 1.0) * 10.0
         top_score += min(max(price_change_24h, delta_price, 0.0) / 12.0, 1.0) * 8.0
@@ -567,6 +619,14 @@ def calc_integrated_short_score(
             f"🎯 Top reversal: pump/premium mulai rapuh "
             f"(24h {price_change_24h:+.1f}%, VWAP {d_vwap:+.1f}%)"
         ]
+        _add_unique(top_flags, "SHORT_REJECTION_CONFIRMED")
+        top_contexts.append(
+            f"🧱 Rejection trigger aktif — score {short_rejection_score:.0f}/100"
+        )
+        if failed_breakout:
+            top_score += 8.0
+            _add_unique(top_flags, "FAILED_BREAKOUT_SHORT")
+            top_contexts.append("🚫 Failed breakout: high baru gagal dipertahankan")
         if delta_cvd_spot < -1.0:
             top_score += 6.0
             _add_unique(top_flags, "DIV_HIDDEN_DIST")
@@ -582,7 +642,13 @@ def calc_integrated_short_score(
         setup_scores.append(("top_reversal_short", top_score, top_flags, top_contexts))
 
     # ── 6) Bearish divergence: harga belum jatuh tapi flow sudah rusak ─
-    if div_score > 0:
+    divergence_confirmed = (
+        rejection_confirmed
+        or delta_price_short <= -0.4
+        or strong_bear_flow
+        or (delta_price <= 0.0 and delta_cvd_spot < -1.0)
+    )
+    if div_score > 0 and divergence_confirmed:
         divergence_score = div_score
         divergence_flags = ["BEARISH_DIVERGENCE_SHORT"]
         divergence_contexts = list(div_contexts)
@@ -593,6 +659,9 @@ def calc_integrated_short_score(
             divergence_score += 4.0
         if funding_hot or oi_hot:
             divergence_score += 5.0
+        if rejection_confirmed:
+            divergence_score += 5.0
+            _add_unique(divergence_flags, "SHORT_REJECTION_CONFIRMED")
         setup_scores.append(("bearish_divergence_short", divergence_score, divergence_flags, divergence_contexts))
 
     if not setup_scores:
@@ -624,6 +693,23 @@ def calc_integrated_short_score(
         _add_unique(flags, "SHORT_FLOW_CONFLICT")
         contexts.append("⚠️ CVD dua market bullish — short ditahan")
 
+    if bullish_breakout_risk and primary_setup in (
+        "distribution_short",
+        "bearish_divergence_short",
+        "exhaustion_after_pump_short",
+        "top_reversal_short",
+    ):
+        score *= 0.58
+        _add_unique(flags, "SHORT_BREAKOUT_RISK")
+        contexts.append("⚠️ Breakout risk: harga masih close kuat — short diturunkan ke watch")
+
+    if (
+        primary_setup in ("top_reversal_short", "exhaustion_after_pump_short")
+        and not rejection_confirmed
+    ):
+        score *= 0.70
+        contexts.append("⏳ Top short belum punya rejection trigger penuh")
+
     if squeeze_type == "long_exhausted":
         score *= 0.60
         contexts.append("🔄 Long squeeze exhausted — rawan bounce, short ditahan")
@@ -646,6 +732,7 @@ def calc_integrated_short_score(
         dist_score=dist_score,
         div_score=div_score,
         ls_score=ls_score,
+        rejection_confirmed=rejection_confirmed,
     )
     if cap_reason:
         contexts.append(f"🧯 {cap_reason} — confidence short dibatasi")
