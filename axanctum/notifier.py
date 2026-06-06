@@ -169,9 +169,9 @@ def build_telegram_message(r: Dict, signal_type: str = "LONG", regime_ctx=None) 
             grade       = "REV"
         else:
             # Grade SHORT berdasarkan ls_score
-            if score >= 85:   grade_emoji, grade_label, grade = "🔥", "🔥 PRIME SHORT", "A+"
-            elif score >= 70: grade_emoji, grade_label, grade = "🩸", "🩸 STRONG SHORT", "A"
-            elif score >= 55: grade_emoji, grade_label, grade = "🟠", "🟠 DECENT SHORT", "B+"
+            if score >= 92:   grade_emoji, grade_label, grade = "🔥", "🔥 PRIME SHORT", "A+"
+            elif score >= 82: grade_emoji, grade_label, grade = "🩸", "🩸 STRONG SHORT", "A"
+            elif score >= 72: grade_emoji, grade_label, grade = "🟠", "🟠 DECENT SHORT", "B+"
             else:             grade_emoji, grade_label, grade = "📊", "📊 WATCH SHORT", "B"
     else:
         grade_emoji = {

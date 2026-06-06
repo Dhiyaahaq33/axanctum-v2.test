@@ -1116,11 +1116,11 @@ async def run_scan_batch(
         )
 
         tgt = short_r.get("ls_targets", {})
-        if short_score >= 85:
+        if short_score >= 92:
             grade = "A+"
-        elif short_score >= 75:
+        elif short_score >= 82:
             grade = "A"
-        elif short_score >= 65:
+        elif short_score >= 72:
             grade = "B+"
         else:
             grade = "B"

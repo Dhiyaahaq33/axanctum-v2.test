@@ -17,6 +17,98 @@ def _clamp_score(score: float) -> float:
     return max(0.0, min(100.0, score))
 
 
+def _cap_short_score(
+    *,
+    score: float,
+    primary_setup: str,
+    price_change_24h: float,
+    d_vwap: float,
+    delta_price_short: float,
+    delta_cvd_spot: float,
+    delta_cvd_fut: float,
+    delta_oi: float,
+    funding_rate: float,
+    vol_ratio: float,
+    dist_score: float,
+    div_score: float,
+    ls_score: float,
+) -> tuple[float, str | None]:
+    """Batasi confidence score agar detector tidak otomatis menjadi PRIME."""
+    both_bearish = delta_cvd_spot < -1.0 and delta_cvd_fut < -1.0
+    strong_bear_flow = (
+        delta_cvd_spot <= -2.5 and delta_cvd_fut <= -1.5
+    ) or (delta_cvd_spot + delta_cvd_fut <= -6.0)
+    funding_trapped_long = funding_rate > 0.0001 and price_change_24h <= 0
+    oi_hot = delta_oi > 4.0
+    late_drop = price_change_24h <= -14.0 and d_vwap <= -7.0
+    extreme_late = price_change_24h <= -20.0 or d_vwap <= -11.0
+    fresh_breakdown = -8.0 <= price_change_24h <= 2.0 and -5.0 <= d_vwap <= -0.4 and delta_price_short <= -0.8
+    top_prime = (
+        d_vwap >= 4.0
+        and price_change_24h >= 5.0
+        and delta_cvd_spot <= -2.0
+        and delta_cvd_fut <= 1.0
+        and (funding_rate > 0.0008 or oi_hot)
+        and (dist_score >= 70.0 or div_score >= 60.0)
+        and vol_ratio >= 1.0
+    )
+
+    cap = 88.0
+    reason = None
+
+    if primary_setup == "bear_continuation_short":
+        cap = 86.0
+        if strong_bear_flow and (funding_trapped_long or oi_hot or ls_score >= 60.0):
+            cap = 89.0
+        if late_drop:
+            cap = min(cap, 82.0)
+        if extreme_late:
+            cap = min(cap, 78.0)
+        if not both_bearish and ls_score < 60.0:
+            cap = min(cap, 80.0)
+
+    elif primary_setup == "breakdown_short":
+        cap = 87.0
+        if fresh_breakdown and strong_bear_flow and (funding_trapped_long or oi_hot):
+            cap = 91.0
+        if late_drop:
+            cap = min(cap, 80.0)
+
+    elif primary_setup == "long_squeeze_short":
+        cap = 88.0
+        if ls_score >= 70.0 and (funding_trapped_long or strong_bear_flow):
+            cap = 92.0
+        if extreme_late and not funding_trapped_long:
+            cap = min(cap, 82.0)
+
+    elif primary_setup == "distribution_short":
+        cap = 84.0
+        if d_vwap >= 2.0 and price_change_24h >= -4.0:
+            cap = 89.0
+        if top_prime:
+            cap = 93.0
+        if price_change_24h <= -10.0 and d_vwap <= -5.0:
+            cap = min(cap, 80.0)
+
+    elif primary_setup in ("exhaustion_after_pump_short", "top_reversal_short"):
+        cap = 88.0
+        if top_prime:
+            cap = 94.0
+        elif d_vwap >= 3.0 and price_change_24h >= 3.0 and (dist_score >= 55.0 or div_score >= 45.0):
+            cap = 90.0
+
+    elif primary_setup == "bearish_divergence_short":
+        cap = 86.0
+        if d_vwap >= 2.0 and price_change_24h >= -2.0 and div_score >= 75.0:
+            cap = 91.0
+
+    if score > cap:
+        reason = f"score_cap_{primary_setup}_{cap:.0f}"
+        score = cap
+
+    return score, reason
+
+
 def calc_long_squeeze_score(
     delta_price:  float,
     delta_oi:     float,
@@ -443,19 +535,19 @@ def calc_integrated_short_score(
     exhaustion_evidence = dist_score > 0 or div_score > 0 or delta_cvd_spot < -1.0 or delta_cvd_fut < -1.0
     if pumpish and exhaustion_evidence:
         pump_ref = max(price_change_24h, delta_price, d_vwap)
-        exhaustion_score = 30.0 + min(max(pump_ref, 0.0) / 8.0, 1.0) * 16.0
+        exhaustion_score = 26.0 + min(max(pump_ref, 0.0) / 8.0, 1.0) * 12.0
         exhaustion_flags = ["EXHAUSTION_AFTER_PUMP_SHORT"]
         exhaustion_contexts = [
             f"🪫 Exhaustion after pump: 24h {price_change_24h:+.1f}% VWAP {d_vwap:+.1f}%"
         ]
         if dist_score > 0:
-            exhaustion_score += min(dist_score * 0.35, 18.0)
+            exhaustion_score += min(dist_score * 0.25, 12.0)
             _extend_unique(exhaustion_flags, dist_flags)
         if div_score > 0:
-            exhaustion_score += min(div_score * 0.30, 16.0)
+            exhaustion_score += min(div_score * 0.22, 12.0)
             _extend_unique(exhaustion_flags, div_flags)
         if funding_hot or oi_hot:
-            exhaustion_score += 8.0
+            exhaustion_score += 5.0
             _add_unique(exhaustion_flags, "D_EXHAUSTION")
         setup_scores.append(("exhaustion_after_pump_short", exhaustion_score, exhaustion_flags, exhaustion_contexts))
 
@@ -467,25 +559,25 @@ def calc_integrated_short_score(
     top_flow_break = delta_cvd_spot < -1.0 and delta_cvd_fut < 1.5
     top_deriv_heat = funding_hot or oi_hot or dist_score >= 55.0 or div_score >= 45.0
     if top_reversal_context and top_flow_break and top_deriv_heat:
-        top_score = 42.0
-        top_score += min(max(d_vwap, 0.0) / 8.0, 1.0) * 12.0
-        top_score += min(max(price_change_24h, delta_price, 0.0) / 12.0, 1.0) * 10.0
+        top_score = 36.0
+        top_score += min(max(d_vwap, 0.0) / 8.0, 1.0) * 10.0
+        top_score += min(max(price_change_24h, delta_price, 0.0) / 12.0, 1.0) * 8.0
         top_flags = ["TOP_REVERSAL_SHORT"]
         top_contexts = [
             f"🎯 Top reversal: pump/premium mulai rapuh "
             f"(24h {price_change_24h:+.1f}%, VWAP {d_vwap:+.1f}%)"
         ]
         if delta_cvd_spot < -1.0:
-            top_score += 8.0
+            top_score += 6.0
             _add_unique(top_flags, "DIV_HIDDEN_DIST")
         if funding_hot or oi_hot:
-            top_score += 8.0
+            top_score += 5.0
             _add_unique(top_flags, "D_EXHAUSTION")
         if dist_score > 0:
-            top_score += min(dist_score * 0.25, 14.0)
+            top_score += min(dist_score * 0.20, 10.0)
             _extend_unique(top_flags, dist_flags)
         if div_score > 0:
-            top_score += min(div_score * 0.25, 14.0)
+            top_score += min(div_score * 0.20, 10.0)
             _extend_unique(top_flags, div_flags)
         setup_scores.append(("top_reversal_short", top_score, top_flags, top_contexts))
 
@@ -511,7 +603,7 @@ def calc_integrated_short_score(
     setups = [name for name, _, _, _ in setup_scores]
 
     if len(setups) > 1:
-        score += min((len(setups) - 1) * 4.0, 10.0)
+        score += min((len(setups) - 1) * 1.5, 4.0)
         contexts.append(f"🧩 {len(setups)} short setup selaras: {', '.join(setups[:3])}")
 
     _add_unique(flags, "SHORT_ENGINE")
@@ -539,6 +631,24 @@ def calc_integrated_short_score(
     if vol_ratio < 0.5:
         score *= 0.85
         contexts.append("📉 Volume sepi — short kurang konfirmasi")
+
+    score, cap_reason = _cap_short_score(
+        score=score,
+        primary_setup=primary_setup,
+        price_change_24h=price_change_24h,
+        d_vwap=d_vwap,
+        delta_price_short=delta_price_short,
+        delta_cvd_spot=delta_cvd_spot,
+        delta_cvd_fut=delta_cvd_fut,
+        delta_oi=delta_oi,
+        funding_rate=funding_rate,
+        vol_ratio=vol_ratio,
+        dist_score=dist_score,
+        div_score=div_score,
+        ls_score=ls_score,
+    )
+    if cap_reason:
+        contexts.append(f"🧯 {cap_reason} — confidence short dibatasi")
 
     score = round(_clamp_score(score), 1)
     if score < 25.0:
