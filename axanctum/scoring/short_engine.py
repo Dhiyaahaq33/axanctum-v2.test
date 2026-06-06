@@ -401,6 +401,197 @@ def calc_bearish_divergence_score(
     return score, flags, contexts
 
 
+def calc_short_derivative_state(
+    *,
+    delta_price: float,
+    delta_price_short: float,
+    price_change_24h: float,
+    delta_cvd_spot: float,
+    delta_cvd_fut: float,
+    delta_oi: float,
+    funding_rate: float,
+    d_vwap: float,
+    vol_ratio: float,
+    squeeze_type: str,
+    ls_score: float,
+    dist_score: float,
+    div_score: float,
+    rejection_confirmed: bool,
+    failed_breakout: bool,
+    last_close_position: float,
+    near_24h_high: bool,
+) -> Tuple[str, float, List[str], List[str]]:
+    """
+    Interpretasi derivatif untuk SHORT.
+
+    Output ini bukan setup mandiri. Ia membaca apakah data derivatif sedang
+    mendukung short, memberi fuel breakout, atau justru memperingatkan short
+    telat. Adjustment kecil dipakai oleh integrated short score.
+    """
+    flags: List[str] = []
+    contexts: List[str] = []
+
+    combined_cvd = (delta_cvd_spot * 1.0 + delta_cvd_fut * 1.3) / 2.3
+    strong_bear_flow = (
+        delta_cvd_spot <= -2.5 and delta_cvd_fut <= -1.5
+    ) or (combined_cvd <= -4.0)
+    strong_bull_flow = (
+        delta_cvd_spot >= 2.0 and delta_cvd_fut >= 2.0
+    ) or (combined_cvd >= 4.0)
+    funding_positive = funding_rate > 0.0001
+    funding_hot = funding_rate > 0.0008
+    oi_building = delta_oi > 1.5
+    oi_hot = delta_oi > 4.0
+    oi_deleveraging = delta_oi < -6.0
+    premium = d_vwap >= 1.5
+    deep_discount = price_change_24h <= -12.0 and d_vwap <= -6.0
+    price_still_pushing = (
+        delta_price_short >= 0.4
+        or (delta_price >= 1.0 and last_close_position >= 0.60)
+    )
+
+    if (
+        price_still_pushing
+        and premium
+        and oi_building
+        and delta_cvd_fut >= 1.5
+        and delta_cvd_spot > -2.0
+        and vol_ratio >= 0.7
+        and not rejection_confirmed
+    ):
+        return (
+            "breakout_fuel",
+            -24.0,
+            ["SHORT_DERIV_BREAKOUT_FUEL"],
+            [
+                f"🚀 Deriv breakout fuel: OI {delta_oi:+.1f}% + "
+                f"CVDf {delta_cvd_fut:+.1f}% saat harga masih push"
+            ],
+        )
+
+    if (
+        deep_discount
+        and oi_deleveraging
+        and funding_rate <= 0.0
+        and squeeze_type != "long"
+    ):
+        return (
+            "late_deleveraging",
+            -22.0,
+            ["SHORT_DERIV_LATE_DELEVERAGING"],
+            [
+                f"🪫 Late deleveraging: 24h {price_change_24h:+.1f}% "
+                f"OI {delta_oi:+.1f}% FR {funding_rate*100:+.4f}%"
+            ],
+        )
+
+    if (
+        strong_bear_flow
+        and delta_price >= -0.25
+        and d_vwap <= 1.0
+        and not rejection_confirmed
+    ):
+        return (
+            "sell_pressure_absorbed",
+            -16.0,
+            ["SHORT_DERIV_SELL_PRESSURE_ABSORBED"],
+            [
+                f"🧲 Sell pressure absorbed: CVD gabungan {combined_cvd:+.1f}% "
+                "tapi harga belum turun"
+            ],
+        )
+
+    candidates: List[Tuple[str, float, List[str], List[str]]] = []
+
+    if (
+        (premium or near_24h_high)
+        and oi_building
+        and funding_positive
+        and delta_cvd_spot <= -1.0
+        and delta_cvd_fut <= 1.5
+        and (delta_price <= 1.2 or rejection_confirmed or dist_score >= 55.0)
+    ):
+        candidates.append((
+            "long_trap",
+            12.0 + (4.0 if funding_hot or oi_hot else 0.0),
+            ["SHORT_DERIV_LONG_TRAP"],
+            [
+                f"🪤 Long trap: OI {delta_oi:+.1f}% FR {funding_rate*100:+.4f}% "
+                f"dengan Spot CVD {delta_cvd_spot:+.1f}%"
+            ],
+        ))
+
+    if (
+        strong_bull_flow
+        and (premium or near_24h_high)
+        and delta_price <= 0.5
+        and delta_price_short <= 0.1
+        and (funding_positive or oi_building)
+    ):
+        candidates.append((
+            "buy_pressure_absorbed",
+            11.0,
+            ["SHORT_DERIV_BUY_PRESSURE_ABSORBED"],
+            [
+                f"🧱 Buy pressure absorbed: CVD gabungan {combined_cvd:+.1f}% "
+                "tapi harga gagal lanjut naik"
+            ],
+        ))
+
+    if (
+        -10.0 <= price_change_24h <= -1.0
+        and d_vwap < 0
+        and strong_bear_flow
+        and not deep_discount
+        and (delta_oi > -4.0 or funding_positive)
+    ):
+        candidates.append((
+            "bear_continuation_fresh",
+            10.0,
+            ["SHORT_DERIV_BEAR_CONTINUATION_FRESH"],
+            [
+                f"📉 Fresh bear deriv: 24h {price_change_24h:+.1f}% "
+                f"CVD gabungan {combined_cvd:+.1f}%"
+            ],
+        ))
+
+    if (
+        squeeze_type == "long"
+        and ls_score >= 55.0
+        and not deep_discount
+        and (funding_positive or delta_oi >= 0)
+    ):
+        candidates.append((
+            "long_squeeze_fuel",
+            8.0,
+            ["SHORT_DERIV_LONG_SQUEEZE_FUEL"],
+            [f"💀 Long squeeze fuel aktif — LS {ls_score:.1f}"],
+        ))
+
+    if (
+        (dist_score >= 55.0 or div_score >= 55.0)
+        and (premium or near_24h_high)
+        and not rejection_confirmed
+    ):
+        candidates.append((
+            "pre_distribution_watch",
+            0.0,
+            ["SHORT_DERIV_PRE_DISTRIBUTION_WATCH"],
+            ["⏳ Pre-distribution: deriv rawan short, masih butuh rejection"],
+        ))
+
+    if not candidates:
+        return "neutral", 0.0, [], []
+
+    candidates.sort(key=lambda item: abs(item[1]), reverse=True)
+    state = candidates[0][0]
+    adjustment = max(-24.0, min(18.0, sum(item[1] for item in candidates)))
+    for _, _, item_flags, item_contexts in candidates:
+        _extend_unique(flags, item_flags)
+        contexts.extend(item_contexts)
+    return state, adjustment, flags, contexts
+
+
 def calc_integrated_short_score(
     *,
     delta_price: float,
@@ -429,7 +620,7 @@ def calc_integrated_short_score(
     last_close_position: float = 0.5,
     upper_wick_pct: float = 0.0,
     near_24h_high: bool = False,
-) -> Tuple[float, List[str], List[str], List[str]]:
+) -> Tuple[float, List[str], List[str], List[str], str]:
     """
     Integrated SHORT decision branch.
 
@@ -473,6 +664,39 @@ def calc_integrated_short_score(
         and not last_candle_bearish
         and not rejection_confirmed
     )
+    short_deriv_state, short_deriv_adj, short_deriv_flags, short_deriv_contexts = (
+        calc_short_derivative_state(
+            delta_price=delta_price,
+            delta_price_short=delta_price_short,
+            price_change_24h=price_change_24h,
+            delta_cvd_spot=delta_cvd_spot,
+            delta_cvd_fut=delta_cvd_fut,
+            delta_oi=delta_oi,
+            funding_rate=funding_rate,
+            d_vwap=d_vwap,
+            vol_ratio=vol_ratio,
+            squeeze_type=squeeze_type,
+            ls_score=ls_score,
+            dist_score=dist_score,
+            div_score=div_score,
+            rejection_confirmed=rejection_confirmed,
+            failed_breakout=failed_breakout,
+            last_close_position=last_close_position,
+            near_24h_high=near_24h_high,
+        )
+    )
+    bullish_breakout_risk = bullish_breakout_risk or short_deriv_state == "breakout_fuel"
+    short_deriv_blocker = short_deriv_state in {
+        "breakout_fuel",
+        "late_deleveraging",
+        "sell_pressure_absorbed",
+    }
+    short_deriv_support = short_deriv_state in {
+        "long_trap",
+        "buy_pressure_absorbed",
+        "bear_continuation_fresh",
+        "long_squeeze_fuel",
+    }
 
     # ── 1) Bear continuation: cocok untuk tape bearish sepanjang hari ──
     bear_score = 0.0
@@ -506,6 +730,10 @@ def calc_integrated_short_score(
         _add_unique(bear_flags, "OI_DELEVERAGING")
     if vol_ratio >= 1.2:
         bear_score += 5.0
+    if short_deriv_state == "bear_continuation_fresh":
+        bear_score += 8.0
+        _extend_unique(bear_flags, short_deriv_flags)
+        bear_contexts.extend(short_deriv_contexts[:2])
 
     if bear_score >= 48.0 and below_vwap and any_cvd_bearish:
         setup_scores.append(("bear_continuation_short", bear_score, bear_flags, bear_contexts))
@@ -533,6 +761,9 @@ def calc_integrated_short_score(
             _add_unique(breakdown_flags, "FR_LONG_CROWD")
         if vol_ratio >= 1.0:
             breakdown_score += 5.0
+        if short_deriv_state == "bear_continuation_fresh":
+            breakdown_score += 5.0
+            _extend_unique(breakdown_flags, short_deriv_flags)
         if breakdown_score >= 50.0:
             setup_scores.append(("breakdown_short", breakdown_score, breakdown_flags, breakdown_contexts))
 
@@ -556,6 +787,7 @@ def calc_integrated_short_score(
         or delta_price_short <= -0.35
         or rejection_confirmed
         or strong_bear_flow
+        or short_deriv_state in {"long_trap", "buy_pressure_absorbed"}
     )
     if dist_score > 0 and distribution_confirmed:
         distribution_score = dist_score
@@ -609,7 +841,13 @@ def calc_integrated_short_score(
         and d_vwap >= 2.0
     )
     top_flow_break = delta_cvd_spot < -1.0 and delta_cvd_fut < 1.5
-    top_deriv_heat = funding_hot or oi_hot or dist_score >= 55.0 or div_score >= 45.0
+    top_deriv_heat = (
+        funding_hot
+        or oi_hot
+        or dist_score >= 55.0
+        or div_score >= 45.0
+        or short_deriv_state in {"long_trap", "buy_pressure_absorbed"}
+    )
     if top_reversal_context and top_flow_break and top_deriv_heat and rejection_confirmed:
         top_score = 36.0
         top_score += min(max(d_vwap, 0.0) / 8.0, 1.0) * 10.0
@@ -665,7 +903,7 @@ def calc_integrated_short_score(
         setup_scores.append(("bearish_divergence_short", divergence_score, divergence_flags, divergence_contexts))
 
     if not setup_scores:
-        return 0.0, [], [], []
+        return 0.0, [], [], [], short_deriv_state
 
     setup_scores.sort(key=lambda x: x[1], reverse=True)
     primary_setup, score, flags, contexts = setup_scores[0]
@@ -677,6 +915,22 @@ def calc_integrated_short_score(
 
     _add_unique(flags, "SHORT_ENGINE")
     _add_unique(flags, primary_setup.upper())
+    _extend_unique(flags, short_deriv_flags)
+
+    if short_deriv_contexts:
+        contexts.extend(short_deriv_contexts[:3])
+
+    if short_deriv_blocker:
+        if short_deriv_state == "breakout_fuel":
+            score *= 0.50
+        elif short_deriv_state == "late_deleveraging":
+            score *= 0.58
+        elif short_deriv_state == "sell_pressure_absorbed":
+            score *= 0.62
+        contexts.append(f"🧠 Deriv state blocker: {short_deriv_state}")
+    elif short_deriv_support and short_deriv_adj > 0:
+        score += short_deriv_adj
+        contexts.append(f"🧠 Deriv state support: {short_deriv_state} (+{short_deriv_adj:.1f})")
 
     # ── Anti-late-entry guard: jangan short dasar yang sudah terlalu jauh ─
     late_drop = price_change_24h <= -12.0 and d_vwap <= -6.0
@@ -742,4 +996,4 @@ def calc_integrated_short_score(
         return 0.0, [], [], []
 
     contexts.insert(0, f"▼ SHORT {primary_setup.replace('_', ' ')} — score {score:.1f}")
-    return score, flags, contexts, setups
+    return score, flags, contexts, setups, short_deriv_state

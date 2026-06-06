@@ -226,6 +226,7 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
     ls_score = float(r.get("ls_score", 0.0))
     dist_score = float(r.get("dist_score", 0.0))
     div_score = float(r.get("div_score", 0.0))
+    short_deriv_state = r.get("short_deriv_state", "neutral")
     short_rejection_score = float(r.get("short_rejection_score", 0.0))
     failed_breakout = bool(r.get("failed_breakout", False))
     last_candle_bearish = bool(r.get("last_candle_bearish", False))
@@ -260,6 +261,12 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
         "breakdown_short" in setups or delta_price_short <= -0.8
     )
     long_squeeze_active = "long_squeeze_short" in setups and ls_score >= 55.0
+    deriv_support = bool(flags & {
+        "SHORT_DERIV_LONG_TRAP",
+        "SHORT_DERIV_BUY_PRESSURE_ABSORBED",
+        "SHORT_DERIV_BEAR_CONTINUATION_FRESH",
+        "SHORT_DERIV_LONG_SQUEEZE_FUEL",
+    })
     deriv_edge = (
         strong_bear_flow
         or long_squeeze_active
@@ -267,6 +274,7 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
         or oi_hot_breakdown
         or dist_score >= 72.0
         or div_score >= 72.0
+        or deriv_support
     )
 
     late_entry = price24 <= -14.0 and d_vwap <= -7.0
@@ -314,6 +322,7 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
         or delta_oi > 4.0
         or dist_score >= 70.0
         or div_score >= 70.0
+        or deriv_support
     )
     top_valid = bool(
         setups & top_setups
@@ -349,6 +358,15 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
 
     if bullish_conflict:
         return "blocked", ["bullish_cvd_conflict"]
+
+    if "SHORT_DERIV_BREAKOUT_FUEL" in flags:
+        return "watch", ["deriv_breakout_fuel"]
+
+    if "SHORT_DERIV_LATE_DELEVERAGING" in flags:
+        return "watch", ["deriv_late_deleveraging"]
+
+    if "SHORT_DERIV_SELL_PRESSURE_ABSORBED" in flags:
+        return "watch", ["deriv_sell_pressure_absorbed"]
 
     if breakout_risk and setups & top_setups:
         return "watch", ["breakout_risk_no_rejection"]
@@ -612,7 +630,7 @@ async def scan_coin(
             # ── INTEGRATED SHORT SCORE ────────────────────────────────
             # Cabang short mandiri: LS/DIST/DIV lama tetap dipakai sebagai
             # sub-interpretasi, lalu digabung dengan arah 24h dan breakdown.
-            short_score, short_flags, short_contexts, short_setups = calc_integrated_short_score(
+            short_score, short_flags, short_contexts, short_setups, short_deriv_state = calc_integrated_short_score(
                 delta_price       = delta_price,
                 delta_price_short = delta_price_short,
                 price_change_24h  = price_change_24h,
@@ -741,6 +759,7 @@ async def scan_coin(
                 "short_contexts": short_contexts,
                 "short_setups":   short_setups,
                 "short_targets":  short_targets,
+                "short_deriv_state": short_deriv_state,
                 "short_rejection_score": short_execution["short_rejection_score"],
                 "failed_breakout":       short_execution["failed_breakout"],
                 "last_candle_bearish":   short_execution["last_candle_bearish"],
@@ -1185,7 +1204,8 @@ async def run_scan_batch(
         log.info(
             f"  🏆 Short tertinggi: {top_s['symbol']} "
             f"score={top_s.get('short_score_regime_adj', top_s.get('short_score', 0.0)):.1f} "
-            f"setups={','.join(top_s.get('short_setups', []))}"
+            f"setups={','.join(top_s.get('short_setups', []))} "
+            f"state={top_s.get('short_deriv_state', 'neutral')}"
         )
     log.info("  " + "─" * 115)
 
@@ -1232,10 +1252,11 @@ async def run_scan_batch(
             _mark_sent(sym, "SHORT")
 
         setups = ",".join(r.get("short_setups", [])) or "short"
+        state = r.get("short_deriv_state", "neutral")
         reasons = ",".join(r.get("short_gate_reasons", [])) or "gate_ok"
         log.info(
             f"  📤 {sym:<18} [SHORT] "
-            f"score={short_score:5.1f} setups={setups} gate={reasons} → "
+            f"score={short_score:5.1f} setups={setups} state={state} gate={reasons} → "
             f"{'✓ terkirim' if ok else '✗ gagal'}"
         )
 
