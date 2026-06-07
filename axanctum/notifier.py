@@ -284,6 +284,9 @@ def build_telegram_message(r: Dict, signal_type: str = "LONG", regime_ctx=None) 
     if "OI_HOT_BEARISH"          in flags: signal_parts.append("⚠️ OI Hot Bear")
     if "OI_DELEVERAGING"         in flags: signal_parts.append("💧 OI Deleveraging")
     if "VWAP_BELOW"              in flags: signal_parts.append("📏 Below VWAP")
+    if "FRESH_BEAR_EXPANSION"    in flags: signal_parts.append("✅ Fresh Bear Expansion")
+    if "POST_DROP_EXHAUSTION"    in flags: signal_parts.append("🪫 Post-Drop Exhaustion")
+    if "STALE_BEAR_CVD"          in flags: signal_parts.append("🧊 Stale Bear CVD")
     if "D_EXHAUSTION"            in flags: signal_parts.append("💀 Overleveraged")
     if "E_DISTRIBUTION"          in flags: signal_parts.append("🪤 Distribution")
     if "ABSORPTION"              in flags: signal_parts.append("🧱 Absorption")
@@ -305,8 +308,14 @@ def build_telegram_message(r: Dict, signal_type: str = "LONG", regime_ctx=None) 
         warnings.append("🔄 Long Squeeze selesai — setup reversal/bounce terbentuk")
     if "SHORT_FLOW_CONFLICT" in flags:
         warnings.append("⚠️ Flow konflik — CVD bullish menahan validitas short")
+    if "SHORT_TRAP_RISK" in flags:
+        warnings.append("🪤 Short trap risk — selloff sudah konsolidasi di low")
+    elif "POST_DROP_EXHAUSTION" in flags:
+        warnings.append("🪫 Post-drop exhaustion — butuh breakdown baru")
+    if "SHORT_FUEL_SPENT" in flags:
+        warnings.append("💧 OI deleveraging — fuel continuation mulai habis")
     # CVD-Vol warning dari contexts
-    for c in r.get("contexts", []):
+    for c in _ctx_source:
         if "CVD-Vol Inconsistent" in c:
             warnings.append("⚠️ CVD momentum memudar — volume tidak konfirmasi")
             break
@@ -314,7 +323,7 @@ def build_telegram_message(r: Dict, signal_type: str = "LONG", regime_ctx=None) 
             warnings.append("🟡 CVD momentum lemah — konfirmasi tipis")
             break
     # FR velocity warning
-    for c in r.get("contexts", []):
+    for c in _ctx_source:
         if "FOMO akut" in c:
             warnings.append("💥 FR naik cepat — potensi blow-off top")
             break

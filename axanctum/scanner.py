@@ -309,6 +309,217 @@ def _calc_long_phase_state(
     return state
 
 
+def _calc_oi_window_state(oi_list, recent_n: int, prior_n: int) -> Dict:
+    state = {
+        "recent_pct": 0.0,
+        "prior_pct": 0.0,
+        "flat": True,
+        "deleveraging": False,
+        "building": False,
+    }
+    if not oi_list or len(oi_list) < recent_n + prior_n + 1:
+        return state
+
+    window = [float(v) for v in oi_list[-(recent_n + prior_n + 1):]]
+    prior_start = window[0]
+    recent_start = window[prior_n]
+    current = window[-1]
+
+    prior_pct = ((recent_start - prior_start) / prior_start * 100.0) if prior_start > 0 else 0.0
+    recent_pct = ((current - recent_start) / recent_start * 100.0) if recent_start > 0 else 0.0
+
+    state.update({
+        "recent_pct": round(recent_pct, 2),
+        "prior_pct": round(prior_pct, 2),
+        "flat": abs(recent_pct) <= 0.8,
+        "deleveraging": recent_pct <= -1.2,
+        "building": recent_pct >= 1.0,
+    })
+    return state
+
+
+def _calc_short_phase_state(
+    fut_df,
+    spot_df,
+    oi_hist,
+    *,
+    n: int,
+    candles_24h: int,
+    price_change_24h: float,
+    delta_price: float,
+    delta_price_short: float,
+    d_vwap: float,
+    delta_oi: float,
+    funding_rate: float,
+    squeeze_type: str,
+    vol_ratio: float,
+) -> Dict:
+    """
+    Deteksi apakah short continuation masih fresh atau hanya residu selloff lama.
+
+    Bearish aggregate data tetap penting, tapi alert short harus turun kelas saat
+    harga sudah range di low, CVD terbaru tidak ekspansif, dan OI sudah keluar.
+    """
+    recent_n = max(5, min(12, max(1, n // 2)))
+    prior_n = recent_n
+    state = {
+        "state": "neutral",
+        "flags": [],
+        "contexts": [],
+        "score_mult": 1.0,
+        "score_cap": None,
+        "spot_cvd": _calc_cvd_window_state(spot_df, recent_n, prior_n),
+        "fut_cvd": _calc_cvd_window_state(fut_df, recent_n, prior_n),
+        "oi": _calc_oi_window_state(oi_hist, recent_n, prior_n),
+    }
+
+    if fut_df is None or len(fut_df) < recent_n + prior_n + 1:
+        return state
+
+    close = float(fut_df["close"].iloc[-1])
+    if close <= 0:
+        return state
+
+    recent = fut_df.tail(recent_n)
+    prior_anchor = float(fut_df["close"].iloc[-recent_n - prior_n - 1])
+    recent_start = float(fut_df["close"].iloc[-recent_n - 1])
+    prior_move = (recent_start - prior_anchor) / prior_anchor * 100.0 if prior_anchor > 0 else 0.0
+    recent_move = (close - recent_start) / recent_start * 100.0 if recent_start > 0 else 0.0
+    recent_high = float(recent["high"].max())
+    recent_low = float(recent["low"].min())
+    recent_range = (recent_high - recent_low) / close * 100.0 if close > 0 else 0.0
+
+    prev_range = fut_df.iloc[-recent_n - 1:-1]
+    range_low = float(prev_range["low"].min()) if len(prev_range) else recent_low
+    breakdown_down = bool(close < range_low * 0.997 and delta_price_short <= -0.35)
+
+    lookback_24h = max(3, min(candles_24h, len(fut_df)))
+    tail_24h = fut_df.tail(lookback_24h)
+    low_24h = float(tail_24h["low"].min())
+    high_24h = float(tail_24h["high"].max())
+    day_range = high_24h - low_24h
+    low_position = (close - low_24h) / day_range if day_range > 0 else 0.5
+
+    prior_drop = bool(price_change_24h <= -4.0 or prior_move <= -3.0 or delta_price <= -2.0)
+    range_sideways = bool(
+        abs(recent_move) <= 1.4
+        and recent_range <= max(2.2, abs(prior_move) * 0.65)
+    )
+    near_low = bool(low_position <= 0.35 or d_vwap <= -2.5)
+
+    spot = state["spot_cvd"]
+    fut = state["fut_cvd"]
+    oi = state["oi"]
+    spot_bear_expanding = bool(
+        spot["recent_pct"] <= -1.2
+        and (not spot["choppy"] or spot["efficiency"] >= 0.50 or spot["recent_pct"] <= -2.5)
+    )
+    fut_bear_expanding = bool(
+        fut["recent_pct"] <= -1.2
+        and (not fut["choppy"] or fut["efficiency"] >= 0.50 or fut["recent_pct"] <= -2.5)
+    )
+    combined_recent_cvd = (spot["recent_pct"] + fut["recent_pct"] * 1.3) / 2.3
+    combined_prior_cvd = (spot["prior_pct"] + fut["prior_pct"] * 1.3) / 2.3
+    spot_bear_faded = bool(
+        spot["prior_pct"] <= -2.0
+        and spot["recent_pct"] < 0
+        and abs(spot["recent_pct"]) <= abs(spot["prior_pct"]) * 0.45
+    )
+    fut_bear_faded = bool(
+        fut["prior_pct"] <= -2.0
+        and fut["recent_pct"] < 0
+        and abs(fut["recent_pct"]) <= abs(fut["prior_pct"]) * 0.45
+    )
+    bear_cvd_faded = bool(
+        spot_bear_faded
+        or fut_bear_faded
+        or (
+            combined_prior_cvd <= -2.0
+            and combined_recent_cvd < 0
+            and abs(combined_recent_cvd) <= abs(combined_prior_cvd) * 0.45
+        )
+    )
+    bear_cvd_expanding = bool(
+        combined_recent_cvd <= -1.4
+        and (spot_bear_expanding or fut_bear_expanding)
+        and not bear_cvd_faded
+    )
+    stale_bear_cvd = bool(
+        (
+            spot["prior_pct"] <= -1.2
+            or fut["prior_pct"] <= -1.2
+            or spot["recent_pct"] < 0
+            or fut["recent_pct"] < 0
+        )
+        and not bear_cvd_expanding
+        and (
+            (spot["flat"] or spot["choppy"])
+            and (fut["flat"] or fut["choppy"])
+            or bear_cvd_faded
+            or abs(combined_recent_cvd) <= 1.4
+        )
+    )
+    oi_deleveraging = bool(delta_oi <= -2.0 or oi["deleveraging"])
+    oi_building = bool(delta_oi >= 1.5 or oi["building"])
+    fresh_fuel = bool(oi_building or squeeze_type == "long" or (funding_rate > 0.0001 and delta_oi > -2.0))
+    fresh_breakdown = bool(
+        breakdown_down
+        and bear_cvd_expanding
+        and (fresh_fuel or vol_ratio >= 1.2)
+    )
+
+    if fresh_breakdown:
+        state.update({
+            "state": "fresh_bear_expansion",
+            "flags": ["FRESH_BEAR_EXPANSION"],
+            "contexts": [
+                f"✅ Fresh bear expansion: range low pecah + CVD recent {combined_recent_cvd:+.1f}%"
+            ],
+            "score_mult": 1.04,
+            "score_cap": None,
+        })
+        return state
+
+    if prior_drop and range_sideways and near_low and stale_bear_cvd and oi_deleveraging:
+        state.update({
+            "state": "short_trap_risk",
+            "flags": ["POST_DROP_EXHAUSTION", "SHORT_TRAP_RISK", "STALE_BEAR_CVD", "SHORT_FUEL_SPENT"],
+            "contexts": [
+                f"🪫 Post-drop exhaustion: harga range di low, CVD recent {combined_recent_cvd:+.1f}% tidak ekspansif",
+                f"💧 Short fuel spent: OI {delta_oi:+.1f}% / recent {oi['recent_pct']:+.1f}% sudah deleveraging",
+            ],
+            "score_mult": 0.50,
+            "score_cap": 56.0,
+        })
+        return state
+
+    if prior_drop and range_sideways and near_low and stale_bear_cvd:
+        state.update({
+            "state": "post_drop_exhaustion",
+            "flags": ["POST_DROP_EXHAUSTION", "STALE_BEAR_CVD"],
+            "contexts": [
+                f"⏸️ Bear residue: post-drop range, CVD recent {combined_recent_cvd:+.1f}% "
+                f"vs prior spot/fut {spot['prior_pct']:+.1f}/{fut['prior_pct']:+.1f}%"
+            ],
+            "score_mult": 0.68,
+            "score_cap": 64.0,
+        })
+        return state
+
+    if prior_drop and near_low and oi_deleveraging and not bear_cvd_expanding:
+        state.update({
+            "state": "short_fuel_spent",
+            "flags": ["SHORT_FUEL_SPENT"],
+            "contexts": [
+                f"💧 OI deleveraging tanpa CVD ekspansif — fuel continuation menipis ({delta_oi:+.1f}%)"
+            ],
+            "score_mult": 0.76,
+            "score_cap": 68.0,
+        })
+
+    return state
+
+
 def _classify_long_setups(r: Dict) -> List[str]:
     """
     Klasifikasikan setup LONG aktual dari hasil scan.
@@ -432,6 +643,7 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
     dist_score = float(r.get("dist_score", 0.0))
     div_score = float(r.get("div_score", 0.0))
     short_deriv_state = r.get("short_deriv_state", "neutral")
+    short_phase_state = r.get("short_phase_state", "neutral")
     short_rejection_score = float(r.get("short_rejection_score", 0.0))
     failed_breakout = bool(r.get("failed_breakout", False))
     last_candle_bearish = bool(r.get("last_candle_bearish", False))
@@ -466,6 +678,14 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
         "breakdown_short" in setups or delta_price_short <= -0.8
     )
     long_squeeze_active = "long_squeeze_short" in setups and ls_score >= 55.0
+    fresh_bear_expansion = (
+        short_phase_state == "fresh_bear_expansion"
+        or "FRESH_BEAR_EXPANSION" in flags
+    )
+    post_drop_risk = (
+        short_phase_state in {"post_drop_exhaustion", "short_trap_risk", "short_fuel_spent"}
+        or bool(flags & {"POST_DROP_EXHAUSTION", "SHORT_TRAP_RISK", "SHORT_FUEL_SPENT"})
+    )
     deriv_support = bool(flags & {
         "SHORT_DERIV_LONG_TRAP",
         "SHORT_DERIV_BUY_PRESSURE_ABSORBED",
@@ -501,7 +721,8 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
         long_squeeze_active
         or funding_trapped_long
         or oi_hot_breakdown
-        or (strong_bear_flow and delta_oi > -6.0)
+        or (strong_bear_flow and delta_oi > -6.0 and not post_drop_risk)
+        or fresh_bear_expansion
     )
 
     top_context = price24 >= 3.0 or delta_price >= 1.2 or d_vwap >= 3.0
@@ -555,12 +776,14 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
     )
     continuation_trigger = bool(
         breakdown_fresh
+        or fresh_bear_expansion
         or long_squeeze_active
-        or "SHORT_DERIV_BEAR_CONTINUATION_FRESH" in flags
+        or ("SHORT_DERIV_BEAR_CONTINUATION_FRESH" in flags and not post_drop_risk)
         or (
             funding_trapped_long
             and strong_bear_flow
             and delta_oi > -6.0
+            and not post_drop_risk
         )
         or (
             oi_hot_breakdown
@@ -574,6 +797,7 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
         and deriv_edge
         and weak_bear_flow
         and vol_ratio >= 0.7
+        and not post_drop_risk
     )
 
     # Distribution dari area bawah bukan top alert; dia hanya memperkuat continuation.
@@ -598,6 +822,14 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
 
     if "SHORT_DERIV_SELL_PRESSURE_ABSORBED" in flags:
         return "watch", ["deriv_sell_pressure_absorbed"]
+
+    if (
+        post_drop_risk
+        and setups & {"bear_continuation_short", "breakdown_short"}
+        and not long_squeeze_active
+        and not fresh_bear_expansion
+    ):
+        return "watch", [short_phase_state if short_phase_state != "neutral" else "post_drop_exhaustion"]
 
     if breakout_risk and setups & top_setups:
         return "watch", ["breakout_risk_no_rejection"]
@@ -782,6 +1014,22 @@ async def scan_coin(
                 delta_cvd_fut=delta_cvd_fut,
             )
 
+            short_phase = _calc_short_phase_state(
+                fut_df,
+                spot_df if spot_available else None,
+                oi_hist,
+                n=N,
+                candles_24h=candles_24h,
+                price_change_24h=price_change_24h,
+                delta_price=delta_price,
+                delta_price_short=delta_price_short,
+                d_vwap=d_vwap,
+                delta_oi=delta_oi,
+                funding_rate=fr,
+                squeeze_type=squeeze_type,
+                vol_ratio=vol_ratio,
+            )
+
             # ── SCORING MATRIX ─────────────────────────────────────────
             score, flags, contexts = calculate_market_score(
                 d_vwap         = d_vwap,
@@ -921,6 +1169,15 @@ async def scan_coin(
                 near_24h_high         = short_execution["near_24h_high"],
             )
 
+            if short_score > 0 and short_phase["flags"]:
+                for flag in short_phase["flags"]:
+                    if flag not in short_flags:
+                        short_flags.append(flag)
+                short_contexts.extend(short_phase["contexts"])
+                short_score = round(short_score * float(short_phase["score_mult"]), 1)
+                if short_phase["score_cap"] is not None:
+                    short_score = min(short_score, float(short_phase["score_cap"]))
+
             if short_score > 0:
                 short_targets = calc_price_targets(
                     price         = current_price,
@@ -1025,6 +1282,12 @@ async def scan_coin(
                 "short_setups":   short_setups,
                 "short_targets":  short_targets,
                 "short_deriv_state": short_deriv_state,
+                "short_phase_state": short_phase["state"],
+                "short_phase_flags": short_phase["flags"],
+                "short_phase_contexts": short_phase["contexts"],
+                "short_spot_cvd_phase": short_phase["spot_cvd"],
+                "short_fut_cvd_phase": short_phase["fut_cvd"],
+                "short_oi_phase": short_phase["oi"],
                 "short_rejection_score": short_execution["short_rejection_score"],
                 "failed_breakout":       short_execution["failed_breakout"],
                 "last_candle_bearish":   short_execution["last_candle_bearish"],
@@ -1481,7 +1744,8 @@ async def run_scan_batch(
             f"  🏆 Short tertinggi: {top_s['symbol']} "
             f"score={top_s.get('short_score_regime_adj', top_s.get('short_score', 0.0)):.1f} "
             f"setups={','.join(top_s.get('short_setups', []))} "
-            f"state={top_s.get('short_deriv_state', 'neutral')}"
+            f"state={top_s.get('short_deriv_state', 'neutral')} "
+            f"phase={top_s.get('short_phase_state', 'neutral')}"
         )
     log.info("  " + "─" * 115)
 

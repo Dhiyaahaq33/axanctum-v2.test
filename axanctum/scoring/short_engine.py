@@ -60,6 +60,7 @@ def _cap_short_score(
 
     if primary_setup == "bear_continuation_short":
         cap = 86.0
+        fresh_continuation = delta_price_short <= -0.6 or delta_oi > 1.5 or ls_score >= 55.0
         if strong_bear_flow and (funding_trapped_long or oi_hot or ls_score >= 60.0):
             cap = 89.0
         if late_drop:
@@ -68,6 +69,8 @@ def _cap_short_score(
             cap = min(cap, 78.0)
         if not both_bearish and ls_score < 60.0:
             cap = min(cap, 80.0)
+        if not fresh_continuation:
+            cap = min(cap, 74.0)
 
     elif primary_setup == "breakdown_short":
         cap = 87.0
@@ -755,8 +758,13 @@ def calc_integrated_short_score(
         bear_score += 6.0 + (4.0 if funding_hot else 0.0)
         _add_unique(bear_flags, "FR_LONG_CROWD")
     if oi_deleveraging and delta_price <= 0:
-        bear_score += 4.0
         _add_unique(bear_flags, "OI_DELEVERAGING")
+        if delta_price_short <= -0.6 or squeeze_type == "long" or strong_bear_flow:
+            bear_score += 3.0
+        else:
+            bear_score -= 4.0
+            _add_unique(bear_flags, "SHORT_FUEL_SPENT")
+            bear_contexts.append("💧 OI deleveraging tanpa breakdown baru — fuel short mulai habis")
     if vol_ratio >= 1.2:
         bear_score += 5.0
     if short_deriv_state == "bear_continuation_fresh":
@@ -764,7 +772,13 @@ def calc_integrated_short_score(
         _extend_unique(bear_flags, short_deriv_flags)
         bear_contexts.extend(short_deriv_contexts[:2])
 
-    if bear_score >= 48.0 and below_vwap and any_cvd_bearish:
+    continuation_fresh_hint = bool(
+        delta_price_short <= -0.6
+        or short_deriv_state == "bear_continuation_fresh"
+        or squeeze_type == "long"
+        or (delta_oi > 1.5 and delta_price <= -0.4)
+    )
+    if bear_score >= 48.0 and below_vwap and any_cvd_bearish and continuation_fresh_hint:
         setup_scores.append(("bear_continuation_short", bear_score, bear_flags, bear_contexts))
 
     # ── 2) Breakdown: transisi dari netral ke bawah VWAP ───────────────
