@@ -276,6 +276,14 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
         or div_score >= 72.0
         or deriv_support
     )
+    local_chase_risk = (
+        delta_price_short <= -0.75
+        and d_vwap <= -1.0
+        and last_close_position <= 0.42
+        and not long_squeeze_active
+        and not funding_trapped_long
+        and not oi_hot_breakdown
+    )
 
     late_entry = price24 <= -14.0 and d_vwap <= -7.0
     extreme_late = price24 <= -20.0 or d_vwap <= -11.0
@@ -340,6 +348,21 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
         and -5.0 <= d_vwap <= -0.4
         and delta_price_short <= -0.8
     )
+    continuation_trigger = bool(
+        breakdown_fresh
+        or long_squeeze_active
+        or "SHORT_DERIV_BEAR_CONTINUATION_FRESH" in flags
+        or (
+            funding_trapped_long
+            and strong_bear_flow
+            and delta_oi > -6.0
+        )
+        or (
+            oi_hot_breakdown
+            and weak_bear_flow
+            and price24 > -12.0
+        )
+    )
     bear_continuation_valid = bool(
         setups & trend_setups
         and trend_context
@@ -364,6 +387,9 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
 
     if "SHORT_DERIV_LATE_DELEVERAGING" in flags:
         return "watch", ["deriv_late_deleveraging"]
+
+    if "SHORT_DERIV_LOCAL_BOUNCE_RISK" in flags:
+        return "watch", ["local_bounce_risk"]
 
     if "SHORT_DERIV_SELL_PRESSURE_ABSORBED" in flags:
         return "watch", ["deriv_sell_pressure_absorbed"]
@@ -406,6 +432,12 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
 
     if "bear_continuation_short" in setups and not deriv_edge:
         return "watch", ["no_deriv_edge"]
+
+    if "bear_continuation_short" in setups and local_chase_risk:
+        return "watch", ["continuation_chase_risk"]
+
+    if "bear_continuation_short" in setups and not continuation_trigger:
+        return "watch", ["continuation_needs_trigger"]
 
     if "bear_continuation_short" in setups and not both_bearish and not long_squeeze_active:
         return "watch", ["weak_flow"]

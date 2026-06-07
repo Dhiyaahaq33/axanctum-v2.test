@@ -449,6 +449,17 @@ def calc_short_derivative_state(
         delta_price_short >= 0.4
         or (delta_price >= 1.0 and last_close_position >= 0.60)
     )
+    local_chase_drop = (
+        delta_price_short <= -0.75
+        and d_vwap <= -1.0
+        and last_close_position <= 0.42
+    )
+    weak_continuation_fuel = (
+        delta_oi <= 1.0
+        and funding_rate <= 0.0001
+        and squeeze_type != "long"
+        and ls_score < 55.0
+    )
 
     if (
         price_still_pushing
@@ -482,6 +493,22 @@ def calc_short_derivative_state(
             [
                 f"🪫 Late deleveraging: 24h {price_change_24h:+.1f}% "
                 f"OI {delta_oi:+.1f}% FR {funding_rate*100:+.4f}%"
+            ],
+        )
+
+    if (
+        local_chase_drop
+        and weak_continuation_fuel
+        and not rejection_confirmed
+        and not strong_bear_flow
+    ):
+        return (
+            "local_bounce_risk",
+            -20.0,
+            ["SHORT_DERIV_LOCAL_BOUNCE_RISK"],
+            [
+                f"↩️ Local bounce risk: leg pendek {delta_price_short:+.1f}% "
+                "sudah close dekat low tanpa fuel derivatif"
             ],
         )
 
@@ -543,7 +570,8 @@ def calc_short_derivative_state(
         and d_vwap < 0
         and strong_bear_flow
         and not deep_discount
-        and (delta_oi > -4.0 or funding_positive)
+        and not local_chase_drop
+        and (delta_oi > 1.0 or funding_positive or squeeze_type == "long")
     ):
         candidates.append((
             "bear_continuation_fresh",
@@ -689,6 +717,7 @@ def calc_integrated_short_score(
     short_deriv_blocker = short_deriv_state in {
         "breakout_fuel",
         "late_deleveraging",
+        "local_bounce_risk",
         "sell_pressure_absorbed",
     }
     short_deriv_support = short_deriv_state in {
@@ -925,6 +954,8 @@ def calc_integrated_short_score(
             score *= 0.50
         elif short_deriv_state == "late_deleveraging":
             score *= 0.58
+        elif short_deriv_state == "local_bounce_risk":
+            score *= 0.55
         elif short_deriv_state == "sell_pressure_absorbed":
             score *= 0.62
         contexts.append(f"🧠 Deriv state blocker: {short_deriv_state}")
@@ -993,7 +1024,7 @@ def calc_integrated_short_score(
 
     score = round(_clamp_score(score), 1)
     if score < 25.0:
-        return 0.0, [], [], []
+        return 0.0, [], [], [], short_deriv_state
 
     contexts.insert(0, f"▼ SHORT {primary_setup.replace('_', ' ')} — score {score:.1f}")
     return score, flags, contexts, setups, short_deriv_state
