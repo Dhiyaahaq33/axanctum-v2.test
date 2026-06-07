@@ -114,6 +114,201 @@ def _calc_short_execution_state(fut_df, candles_24h: int) -> Dict:
     return state
 
 
+def _calc_cvd_window_state(df, recent_n: int, prior_n: int) -> Dict:
+    """Baca apakah CVD terbaru ekspansif atau cuma bolak-balik dalam range."""
+    state = {
+        "recent_pct": 0.0,
+        "prior_pct": 0.0,
+        "efficiency": 0.0,
+        "sign_changes": 0,
+        "choppy": False,
+        "flat": True,
+    }
+    if df is None or len(df) < recent_n + prior_n + 1:
+        return state
+
+    window = df.tail(recent_n + prior_n).copy()
+    delta = window["taker_buy_vol"] - window["taker_sell_vol"]
+    total = window["taker_buy_vol"] + window["taker_sell_vol"]
+
+    prior_delta = delta.iloc[:prior_n]
+    prior_total = float(total.iloc[:prior_n].sum())
+    recent_delta = delta.iloc[prior_n:]
+    recent_total = float(total.iloc[prior_n:].sum())
+
+    prior_pct = float(prior_delta.sum() / prior_total * 100.0) if prior_total > 1e-10 else 0.0
+    recent_pct = float(recent_delta.sum() / recent_total * 100.0) if recent_total > 1e-10 else 0.0
+
+    abs_flow = float(recent_delta.abs().sum())
+    efficiency = abs(float(recent_delta.sum())) / abs_flow if abs_flow > 1e-10 else 0.0
+    signed = [
+        1 if value > 0 else -1
+        for value in recent_delta
+        if abs(float(value)) > 1e-10
+    ]
+    sign_changes = sum(1 for i in range(1, len(signed)) if signed[i] != signed[i - 1])
+    choppy = bool(
+        len(signed) >= 4
+        and efficiency <= 0.35
+        and sign_changes >= max(2, len(signed) // 3)
+    )
+    flat = abs(recent_pct) <= 1.0 or (
+        prior_pct > 2.0 and recent_pct < max(0.75, prior_pct * 0.35)
+    )
+
+    state.update({
+        "recent_pct": round(recent_pct, 2),
+        "prior_pct": round(prior_pct, 2),
+        "efficiency": round(efficiency, 3),
+        "sign_changes": sign_changes,
+        "choppy": choppy,
+        "flat": flat,
+    })
+    return state
+
+
+def _calc_long_phase_state(
+    fut_df,
+    spot_df,
+    *,
+    n: int,
+    candles_24h: int,
+    price_change_24h: float,
+    delta_price: float,
+    delta_price_short: float,
+    d_vwap: float,
+    delta_oi: float,
+    funding_rate: float,
+    squeeze_type: str,
+    delta_cvd_fut: float,
+) -> Dict:
+    """
+    Deteksi fase long: fresh accumulation, squeeze watch, atau stale top.
+
+    Fokusnya mencegah jejak rally lama dibaca sebagai demand aktif saat
+    harga sudah konsolidasi di pucuk dan CVD spot hanya mondar-mandir.
+    """
+    recent_n = max(5, min(12, max(1, n // 2)))
+    prior_n = recent_n
+    state = {
+        "state": "neutral",
+        "flags": [],
+        "contexts": [],
+        "score_mult": 1.0,
+        "score_cap": None,
+        "spot_cvd": _calc_cvd_window_state(spot_df, recent_n, prior_n),
+        "fut_cvd": _calc_cvd_window_state(fut_df, recent_n, prior_n),
+    }
+
+    if fut_df is None or len(fut_df) < recent_n + prior_n + 1:
+        return state
+
+    close = float(fut_df["close"].iloc[-1])
+    if close <= 0:
+        return state
+
+    recent = fut_df.tail(recent_n)
+    prior_anchor = float(fut_df["close"].iloc[-recent_n - prior_n - 1])
+    recent_start = float(fut_df["close"].iloc[-recent_n - 1])
+    prior_move = (recent_start - prior_anchor) / prior_anchor * 100.0 if prior_anchor > 0 else 0.0
+    recent_move = (close - recent_start) / recent_start * 100.0 if recent_start > 0 else 0.0
+    recent_high = float(recent["high"].max())
+    recent_low = float(recent["low"].min())
+    recent_range = (recent_high - recent_low) / close * 100.0 if close > 0 else 0.0
+
+    lookback_24h = max(3, min(candles_24h, len(fut_df)))
+    high_24h = float(fut_df.tail(lookback_24h)["high"].max())
+    near_24h_high = bool(high_24h > 0 and recent_high >= high_24h * 0.97)
+    post_rally = bool(
+        (price_change_24h >= 6.0 or prior_move >= 4.0 or delta_price >= 3.0)
+        and d_vwap >= 1.2
+        and near_24h_high
+    )
+    range_sideways = bool(abs(recent_move) <= 2.0 and recent_range <= max(1.8, abs(prior_move) * 0.75))
+
+    prev_range = fut_df.iloc[-recent_n - 1:-1]
+    range_high = float(prev_range["high"].max()) if len(prev_range) else recent_high
+    range_low = float(prev_range["low"].min()) if len(prev_range) else recent_low
+    breakout_up = bool(close > range_high * 1.003)
+    breakdown_down = bool(close < range_low * 0.997)
+
+    spot = state["spot_cvd"]
+    fut = state["fut_cvd"]
+    spot_expanding = bool(
+        spot["recent_pct"] >= 1.2
+        and (not spot["choppy"] or spot["efficiency"] >= 0.55)
+    )
+    spot_pause = bool(spot["flat"] or spot["choppy"])
+    fut_confirm = bool(fut["recent_pct"] >= 1.0 or delta_cvd_fut > 1.0)
+    short_closing = bool(squeeze_type == "short" and delta_oi < -1.5 and delta_price_short > 0.3)
+    confirmed_squeeze = bool(post_rally and breakout_up and spot_expanding and (fut_confirm or short_closing))
+
+    if confirmed_squeeze:
+        state.update({
+            "state": "confirmed_squeeze",
+            "flags": ["CONFIRMED_SHORT_SQUEEZE"],
+            "contexts": [
+                f"✅ Confirmed squeeze: breakout range + Spot CVD {spot['recent_pct']:+.1f}% ekspansif"
+            ],
+            "score_mult": 1.05,
+            "score_cap": None,
+        })
+        return state
+
+    if post_rally and breakdown_down:
+        state.update({
+            "state": "long_thesis_invalid",
+            "flags": ["LONG_THESIS_INVALID", "LONG_EXHAUSTION_RISK"],
+            "contexts": ["⛔ Long thesis invalid: range bawah post-rally ditembus"],
+            "score_mult": 0.35,
+            "score_cap": 48.0,
+        })
+        return state
+
+    if post_rally and range_sideways and spot_pause:
+        flags = ["POST_RALLY_DEMAND_PAUSE", "STALE_SPOT_ACCUM"]
+        contexts = [
+            f"⏸️ Demand pause: post-rally range, Spot CVD recent {spot['recent_pct']:+.1f}% "
+            f"vs prior {spot['prior_pct']:+.1f}%, eff={spot['efficiency']:.2f}"
+        ]
+        score_mult = 0.62
+        score_cap = 62.0
+
+        if funding_rate < 0:
+            flags.append("SQUEEZE_WATCH")
+            contexts.append("🔫 Funding negatif hanya squeeze fuel — belum ada breakout confirmation")
+            score_cap = min(score_cap, 60.0)
+
+        if delta_oi > 1.5 or not fut_confirm:
+            flags.append("LONG_EXHAUSTION_RISK")
+            contexts.append(
+                f"⚠️ Long exhaustion risk: OI {delta_oi:+.1f}% "
+                f"dan Futures CVD recent {fut['recent_pct']:+.1f}% belum confirm"
+            )
+            score_mult = 0.50
+            score_cap = min(score_cap, 56.0)
+
+        state.update({
+            "state": "long_exhaustion_risk" if "LONG_EXHAUSTION_RISK" in flags else "post_rally_demand_pause",
+            "flags": flags,
+            "contexts": contexts,
+            "score_mult": score_mult,
+            "score_cap": score_cap,
+        })
+        return state
+
+    if funding_rate < 0 and post_rally and not confirmed_squeeze:
+        state.update({
+            "state": "squeeze_watch",
+            "flags": ["SQUEEZE_WATCH"],
+            "contexts": ["🔫 Squeeze watch: funding negatif, tapi belum ada breakout + CVD/OI confirmation"],
+            "score_mult": 0.75,
+            "score_cap": 66.0,
+        })
+
+    return state
+
+
 def _classify_long_setups(r: Dict) -> List[str]:
     """
     Klasifikasikan setup LONG aktual dari hasil scan.
@@ -130,7 +325,17 @@ def _classify_long_setups(r: Dict) -> List[str]:
     vol_ratio = float(r.get("vol_ratio", 1.0))
 
     has_accum = bool(flags & {"A", "A_FUTURES", "CONFLUENCE"})
-    has_clean_risk = not bool(flags & {"B_SPECULATIVE", "D_EXHAUSTION", "E_DISTRIBUTION", "ABSORPTION"})
+    has_clean_risk = not bool(flags & {
+        "B_SPECULATIVE",
+        "D_EXHAUSTION",
+        "E_DISTRIBUTION",
+        "ABSORPTION",
+        "POST_RALLY_DEMAND_PAUSE",
+        "STALE_SPOT_ACCUM",
+        "SQUEEZE_WATCH",
+        "LONG_EXHAUSTION_RISK",
+        "LONG_THESIS_INVALID",
+    })
 
     if has_accum and has_clean_risk:
         setups.add("continuation")
@@ -562,6 +767,21 @@ async def scan_coin(
                 delta_price  = delta_price,
             )
 
+            long_phase = _calc_long_phase_state(
+                fut_df,
+                spot_df if spot_available else None,
+                n=N,
+                candles_24h=candles_24h,
+                price_change_24h=price_change_24h,
+                delta_price=delta_price,
+                delta_price_short=delta_price_short,
+                d_vwap=d_vwap,
+                delta_oi=delta_oi,
+                funding_rate=fr,
+                squeeze_type=squeeze_type,
+                delta_cvd_fut=delta_cvd_fut,
+            )
+
             # ── SCORING MATRIX ─────────────────────────────────────────
             score, flags, contexts = calculate_market_score(
                 d_vwap         = d_vwap,
@@ -572,6 +792,7 @@ async def scan_coin(
                 funding_rate   = fr,
                 basis_pct      = basis_pct,
                 fr_velocity    = fr_velocity,
+                vol_ratio      = vol_ratio,
                 squeeze_type   = squeeze_type,
             )
             
@@ -598,6 +819,15 @@ async def scan_coin(
                 score = round(min(100.0, score * cvd_vol_mult), 1)
             if cvd_vol_desc:
                 contexts.append(cvd_vol_desc)
+
+            if long_phase["flags"]:
+                for flag in long_phase["flags"]:
+                    if flag not in flags:
+                        flags.append(flag)
+                contexts.extend(long_phase["contexts"])
+                score = round(score * float(long_phase["score_mult"]), 1)
+                if long_phase["score_cap"] is not None:
+                    score = min(score, float(long_phase["score_cap"]))
 
             targets = calc_price_targets(
                 price         = current_price,
@@ -764,6 +994,9 @@ async def scan_coin(
                 "fr_velocity":       fr_velocity,
                 "absorption_penalty": absorption_penalty,
                 "skip_long":         _skip_long,   # True jika short-term momentum berbalik
+                "long_phase_state":  long_phase["state"],
+                "spot_cvd_phase":    long_phase["spot_cvd"],
+                "fut_cvd_phase":     long_phase["fut_cvd"],
                 # ── forecast fields ────────────────────────────────────
                 "vol_ratio":      vol_ratio,
                 "vol_label":      vol_label,
@@ -1195,6 +1428,16 @@ async def run_scan_batch(
             and r.get("squeeze_fuel", 100) < 45
             and "A" not in r.get("flags", [])
         )
+        and (
+            "CONFIRMED_SHORT_SQUEEZE" in r.get("flags", [])
+            or not bool(set(r.get("flags", [])) & {
+                "POST_RALLY_DEMAND_PAUSE",
+                "STALE_SPOT_ACCUM",
+                "SQUEEZE_WATCH",
+                "LONG_EXHAUSTION_RISK",
+                "LONG_THESIS_INVALID",
+            })
+        )
     ]
     alerts.sort(key=lambda x: x.get("score_regime_adj", x["score"]), reverse=True)
 
@@ -1229,7 +1472,8 @@ async def run_scan_batch(
         log.info(
             f"  🏆 Tertinggi: {top['symbol']} "
             f"score={top['score']:.1f} [{top['grade']}] "
-            f"flags={','.join(top['flags'])}"
+            f"flags={','.join(top['flags'])} "
+            f"phase={top.get('long_phase_state', 'neutral')}"
         )
     if short_alerts:
         top_s = short_alerts[0]
