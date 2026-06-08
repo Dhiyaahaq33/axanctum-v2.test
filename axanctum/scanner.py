@@ -215,15 +215,22 @@ def _calc_long_phase_state(
     recent_high = float(recent["high"].max())
     recent_low = float(recent["low"].min())
     recent_range = (recent_high - recent_low) / close * 100.0 if close > 0 else 0.0
+    split_idx = max(2, len(recent) // 2)
+    early_recent = recent.iloc[:split_idx]
+    late_recent = recent.iloc[split_idx:]
+    early_high = float(early_recent["high"].max()) if len(early_recent) else recent_high
+    early_low = float(early_recent["low"].min()) if len(early_recent) else recent_low
+    late_high = float(late_recent["high"].max()) if len(late_recent) else recent_high
+    late_low = float(late_recent["low"].min()) if len(late_recent) else recent_low
 
     lookback_24h = max(3, min(candles_24h, len(fut_df)))
     high_24h = float(fut_df.tail(lookback_24h)["high"].max())
     near_24h_high = bool(high_24h > 0 and recent_high >= high_24h * 0.97)
-    post_rally = bool(
+    rally_context = bool(
         (price_change_24h >= 6.0 or prior_move >= 4.0 or delta_price >= 3.0)
-        and d_vwap >= 1.2
         and near_24h_high
     )
+    post_rally = bool(rally_context and d_vwap >= 1.2)
     range_sideways = bool(abs(recent_move) <= 2.0 and recent_range <= max(1.8, abs(prior_move) * 0.75))
 
     prev_range = fut_df.iloc[-recent_n - 1:-1]
@@ -234,6 +241,7 @@ def _calc_long_phase_state(
 
     spot = state["spot_cvd"]
     fut = state["fut_cvd"]
+    combined_recent_cvd = (spot["recent_pct"] + fut["recent_pct"] * 1.3) / 2.3
     spot_expanding = bool(
         spot["recent_pct"] >= 1.2
         and (not spot["choppy"] or spot["efficiency"] >= 0.55)
@@ -242,6 +250,24 @@ def _calc_long_phase_state(
     fut_confirm = bool(fut["recent_pct"] >= 1.0 or delta_cvd_fut > 1.0)
     short_closing = bool(squeeze_type == "short" and delta_oi < -1.5 and delta_price_short > 0.3)
     confirmed_squeeze = bool(post_rally and breakout_up and spot_expanding and (fut_confirm or short_closing))
+    lower_high = bool(late_high < early_high * 0.998)
+    lower_low = bool(late_low < early_low * 0.998)
+    local_rollover = bool(
+        not breakout_up
+        and (
+            delta_price_short <= -0.35
+            or recent_move <= -0.6
+            or (lower_high and lower_low)
+        )
+    )
+    bearish_cvd_alignment = bool(
+        (spot["recent_pct"] <= -0.75 and fut["recent_pct"] <= -0.75)
+        or (
+            spot["recent_pct"] < 0
+            and fut["recent_pct"] < 0
+            and combined_recent_cvd <= -1.0
+        )
+    )
 
     if confirmed_squeeze:
         state.update({
@@ -252,6 +278,31 @@ def _calc_long_phase_state(
             ],
             "score_mult": 1.05,
             "score_cap": None,
+        })
+        return state
+
+    if rally_context and local_rollover and bearish_cvd_alignment:
+        flags = [
+            "POST_RALLY_ROLLOVER",
+            "BEARISH_CVD_ALIGNMENT",
+            "STALE_SPOT_ACCUM",
+            "LONG_THESIS_INVALID",
+        ]
+        contexts = [
+            f"⛔ Post-rally rollover: Spot CVD {spot['recent_pct']:+.1f}% "
+            f"dan Futures CVD {fut['recent_pct']:+.1f}% sama-sama bearish",
+            f"📉 Local structure melemah: ΔP5 {delta_price_short:+.1f}% "
+            f"lowerH={lower_high} lowerL={lower_low}",
+        ]
+        if funding_rate < 0:
+            flags.append("SQUEEZE_WATCH")
+            contexts.append("🔫 Funding negatif hanya context — belum ada reclaim/breakout squeeze")
+        state.update({
+            "state": "post_rally_rollover",
+            "flags": flags,
+            "contexts": contexts,
+            "score_mult": 0.25,
+            "score_cap": 42.0,
         })
         return state
 
@@ -542,6 +593,8 @@ def _classify_long_setups(r: Dict) -> List[str]:
         "E_DISTRIBUTION",
         "ABSORPTION",
         "POST_RALLY_DEMAND_PAUSE",
+        "POST_RALLY_ROLLOVER",
+        "BEARISH_CVD_ALIGNMENT",
         "STALE_SPOT_ACCUM",
         "SQUEEZE_WATCH",
         "LONG_EXHAUSTION_RISK",
@@ -1695,6 +1748,8 @@ async def run_scan_batch(
             "CONFIRMED_SHORT_SQUEEZE" in r.get("flags", [])
             or not bool(set(r.get("flags", [])) & {
                 "POST_RALLY_DEMAND_PAUSE",
+                "POST_RALLY_ROLLOVER",
+                "BEARISH_CVD_ALIGNMENT",
                 "STALE_SPOT_ACCUM",
                 "SQUEEZE_WATCH",
                 "LONG_EXHAUSTION_RISK",

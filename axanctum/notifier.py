@@ -269,6 +269,8 @@ def build_telegram_message(r: Dict, signal_type: str = "LONG", regime_ctx=None) 
     if "C_SQUEEZE"               in flags:
         fuel = r.get("squeeze_fuel", 0)
         signal_parts.append(f"🔫 Short Squeeze {fuel:.0f}%")
+    if "POST_RALLY_ROLLOVER"     in flags: signal_parts.append("📉 Post-Rally Rollover")
+    if "BEARISH_CVD_ALIGNMENT"   in flags: signal_parts.append("🔴 Bearish CVD Align")
     if "LONG_SQUEEZE"            in flags:
         fuel = r.get("squeeze_fuel", 0)
         signal_parts.append(f"💀 Long Squeeze {fuel:.0f}%")
@@ -306,6 +308,10 @@ def build_telegram_message(r: Dict, signal_type: str = "LONG", regime_ctx=None) 
         warnings.append("💀 Long Squeeze aktif — HINDARI LONG, pertimbangkan SHORT")
     if "LONG_SQUEEZE_EXHAUSTED" in flags:
         warnings.append("🔄 Long Squeeze selesai — setup reversal/bounce terbentuk")
+    if "BEARISH_CVD_ALIGNMENT" in flags:
+        warnings.append("🔴 Spot/Futures CVD bearish — veto long")
+    if "POST_RALLY_ROLLOVER" in flags:
+        warnings.append("📉 Post-rally rollover — squeeze belum terkonfirmasi")
     if "SHORT_FLOW_CONFLICT" in flags:
         warnings.append("⚠️ Flow konflik — CVD bullish menahan validitas short")
     if "SHORT_TRAP_RISK" in flags:
