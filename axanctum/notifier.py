@@ -281,13 +281,20 @@ def build_telegram_message(r: Dict, signal_type: str = "LONG", regime_ctx=None) 
     if "TOP_REVERSAL_SHORT"      in flags: signal_parts.append("🎯 Top Reversal")
     if "DISTRIBUTION_SHORT"      in flags: signal_parts.append("🪤 Distribution Short")
     if "BEARISH_DIVERGENCE_SHORT" in flags: signal_parts.append("🎭 Bearish Divergence")
+    if "BEARISH_DIVERGENCE_WATCH" in flags: signal_parts.append("🎭 Divergence Watch")
+    if "BEARISH_DIVERGENCE_CONFIRMED" in flags: signal_parts.append("✅ Divergence Confirmed")
+    if "BEARISH_DIVERGENCE_STALE" in flags: signal_parts.append("🕰️ Divergence Stale")
+    if "BEARISH_DIVERGENCE_INVALIDATED" in flags: signal_parts.append("❌ Divergence Invalidated")
+    if "POSSIBLE_SELLER_ABSORPTION" in flags: signal_parts.append("🧲 Seller Absorption")
     if "CVD_CONFLUENCE_BEARISH"  in flags: signal_parts.append("🔴 CVD Bearish")
+    if "SPOT_BID_PERP_SELL_DIVERGENCE" in flags: signal_parts.append("🧲 Spot Bid / Perp Sell")
     if "FR_LONG_CROWD"           in flags: signal_parts.append("💸 Long Crowded")
     if "OI_HOT_BEARISH"          in flags: signal_parts.append("⚠️ OI Hot Bear")
     if "OI_DELEVERAGING"         in flags: signal_parts.append("💧 OI Deleveraging")
     if "VWAP_BELOW"              in flags: signal_parts.append("📏 Below VWAP")
     if "FRESH_BEAR_EXPANSION"    in flags: signal_parts.append("✅ Fresh Bear Expansion")
     if "POST_DROP_EXHAUSTION"    in flags: signal_parts.append("🪫 Post-Drop Exhaustion")
+    if "POST_DUMP_SPOT_ABSORPTION" in flags: signal_parts.append("↩️ Post-Dump Absorption")
     if "STALE_BEAR_CVD"          in flags: signal_parts.append("🧊 Stale Bear CVD")
     if "D_EXHAUSTION"            in flags: signal_parts.append("💀 Overleveraged")
     if "E_DISTRIBUTION"          in flags: signal_parts.append("🪤 Distribution")
@@ -314,6 +321,18 @@ def build_telegram_message(r: Dict, signal_type: str = "LONG", regime_ctx=None) 
         warnings.append("📉 Post-rally rollover — squeeze belum terkonfirmasi")
     if "SHORT_FLOW_CONFLICT" in flags:
         warnings.append("⚠️ Flow konflik — CVD bullish menahan validitas short")
+    if "BEARISH_DIVERGENCE_WATCH" in flags:
+        warnings.append("🎭 Bearish divergence baru watch — belum ada confirmation price structure")
+    if "BEARISH_DIVERGENCE_STALE" in flags:
+        warnings.append("🕰️ Bearish divergence stale — sudah lewat TTL")
+    if "BEARISH_DIVERGENCE_INVALIDATED" in flags:
+        warnings.append("❌ Bearish divergence invalidated — higher high / reclaim muncul")
+    if "POSSIBLE_SELLER_ABSORPTION" in flags:
+        warnings.append("🧲 Price hold/rise saat CVD melemah — possible seller absorption")
+    if "SPOT_BID_PERP_SELL_DIVERGENCE" in flags:
+        warnings.append("🧲 Spot bid vs perp sell — short trap / bounce risk")
+    if "POST_DUMP_SPOT_ABSORPTION" in flags:
+        warnings.append("↩️ Post-dump absorption — bear continuation sudah telat")
     if "SHORT_TRAP_RISK" in flags:
         warnings.append("🪤 Short trap risk — selloff sudah konsolidasi di low")
     elif "POST_DROP_EXHAUSTION" in flags:

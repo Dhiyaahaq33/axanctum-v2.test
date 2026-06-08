@@ -106,6 +106,10 @@ def _cap_short_score(
         cap = 86.0
         if d_vwap >= 2.0 and price_change_24h >= -2.0 and div_score >= 75.0:
             cap = 91.0
+    elif primary_setup == "bearish_divergence_watch":
+        cap = 36.0
+        if price_change_24h <= 0 and d_vwap <= 0:
+            cap = min(cap, 28.0)
 
     if score > cap:
         reason = f"score_cap_{primary_setup}_{cap:.0f}"
@@ -645,6 +649,13 @@ def calc_integrated_short_score(
     div_score: float,
     div_flags: List[str],
     div_contexts: List[str],
+    divergence_type: str,
+    divergence_status: str,
+    price_structure_state: str,
+    broke_recent_swing_low: bool,
+    absorption_risk: bool,
+    divergence_age_candles: int,
+    short_score_cap_reason: str,
     short_rejection_score: float = 0.0,
     failed_breakout: bool = False,
     last_candle_bearish: bool = False,
@@ -661,6 +672,16 @@ def calc_integrated_short_score(
     LS/DIST/DIV lama tetap dipakai sebagai sub-interpretasi.
     """
     setup_scores: List[Tuple[str, float, List[str], List[str]]] = []
+
+    divergence_confirmed = divergence_status == "confirmed"
+    divergence_watch = divergence_status == "watch"
+    divergence_stale = divergence_status == "stale"
+    divergence_invalidated = divergence_status == "invalidated"
+    price_structure_broken = bool(
+        broke_recent_swing_low
+        or price_structure_state in {"lower_high_lower_low", "breakdown_confirmed"}
+    )
+    price_structure_intact = price_structure_state in {"bullish_intact", "range_hold"}
 
     both_cvd_bearish = delta_cvd_spot < 0 and delta_cvd_fut < 0
     any_cvd_bearish = delta_cvd_spot < -1.0 or delta_cvd_fut < -1.0
@@ -853,7 +874,12 @@ def calc_integrated_short_score(
 
     # ── 5) Exhaustion after pump: fade pucuk, bukan trend-follow short ──
     pumpish = price_change_24h >= 3.0 or delta_price >= 1.2 or d_vwap >= 3.0
-    exhaustion_evidence = dist_score > 0 or div_score > 0 or delta_cvd_spot < -1.0 or delta_cvd_fut < -1.0
+    exhaustion_evidence = (
+        dist_score > 0
+        or (divergence_confirmed and div_score > 0)
+        or delta_cvd_spot < -1.0
+        or delta_cvd_fut < -1.0
+    )
     if pumpish and exhaustion_evidence and soft_rejection:
         pump_ref = max(price_change_24h, delta_price, d_vwap)
         exhaustion_score = 26.0 + min(max(pump_ref, 0.0) / 8.0, 1.0) * 12.0
@@ -870,7 +896,7 @@ def calc_integrated_short_score(
         if dist_score > 0:
             exhaustion_score += min(dist_score * 0.25, 12.0)
             _extend_unique(exhaustion_flags, dist_flags)
-        if div_score > 0:
+        if div_score > 0 and divergence_confirmed:
             exhaustion_score += min(div_score * 0.22, 12.0)
             _extend_unique(exhaustion_flags, div_flags)
         if funding_hot or oi_hot:
@@ -888,7 +914,7 @@ def calc_integrated_short_score(
         funding_hot
         or oi_hot
         or dist_score >= 55.0
-        or div_score >= 45.0
+        or (divergence_confirmed and div_score >= 45.0)
         or short_deriv_state in {"long_trap", "buy_pressure_absorbed"}
     )
     if top_reversal_context and top_flow_break and top_deriv_heat and rejection_confirmed:
@@ -917,33 +943,68 @@ def calc_integrated_short_score(
         if dist_score > 0:
             top_score += min(dist_score * 0.20, 10.0)
             _extend_unique(top_flags, dist_flags)
-        if div_score > 0:
+        if div_score > 0 and divergence_confirmed:
             top_score += min(div_score * 0.20, 10.0)
             _extend_unique(top_flags, div_flags)
         setup_scores.append(("top_reversal_short", top_score, top_flags, top_contexts))
 
-    # ── 6) Bearish divergence: harga belum jatuh tapi flow sudah rusak ─
-    divergence_confirmed = (
-        rejection_confirmed
-        or delta_price_short <= -0.4
-        or strong_bear_flow
-        or (delta_price <= 0.0 and delta_cvd_spot < -1.0)
-    )
-    if div_score > 0 and divergence_confirmed:
-        divergence_score = div_score
-        divergence_flags = ["BEARISH_DIVERGENCE_SHORT"]
-        divergence_contexts = list(div_contexts)
-        _extend_unique(divergence_flags, div_flags)
-        if price_change_24h >= -2.0:
-            divergence_score += 5.0
-        if d_vwap > 1.0:
-            divergence_score += 4.0
-        if funding_hot or oi_hot:
-            divergence_score += 5.0
-        if rejection_confirmed:
-            divergence_score += 5.0
-            _add_unique(divergence_flags, "SHORT_REJECTION_CONFIRMED")
-        setup_scores.append(("bearish_divergence_short", divergence_score, divergence_flags, divergence_contexts))
+    # ── 6) Bearish divergence: watch dulu, confirm hanya jika struktur pecah ─
+    if div_score > 0:
+        if divergence_watch or divergence_stale or divergence_invalidated:
+            divergence_score = div_score
+            divergence_flags = [div_state_flag for div_state_flag in [
+                "BEARISH_DIVERGENCE_WATCH" if divergence_watch else None,
+                "BEARISH_DIVERGENCE_STALE" if divergence_stale else None,
+                "BEARISH_DIVERGENCE_INVALIDATED" if divergence_invalidated else None,
+            ] if div_state_flag]
+            divergence_contexts = list(div_contexts)
+            _extend_unique(divergence_flags, div_flags)
+            if absorption_risk:
+                _add_unique(divergence_flags, "POSSIBLE_SELLER_ABSORPTION")
+                divergence_contexts.append(
+                    f"🧲 Absorption risk: {price_structure_state} tanpa breakdown, divergence age {divergence_age_candles}c"
+                )
+            if divergence_watch:
+                divergence_score = min(divergence_score, 28.0 if absorption_risk else 30.0)
+                divergence_contexts.append(
+                    f"🎭 Divergence watch: {divergence_type} / struct={price_structure_state} / age={divergence_age_candles}c"
+                )
+            elif divergence_stale:
+                divergence_score = min(divergence_score, 12.0)
+                divergence_contexts.append(
+                    f"🕰️ Divergence stale: {divergence_age_candles} candle tanpa breakdown konfirmasi"
+                )
+            elif divergence_invalidated:
+                divergence_score = 0.0
+                divergence_contexts.append(
+                    "❌ Divergence invalidated: higher high / reclaim muncul sebelum breakdown"
+                )
+            if divergence_score > 0:
+                setup_scores.append(("bearish_divergence_watch", divergence_score, divergence_flags, divergence_contexts))
+
+        divergence_short_trigger = bool(
+            divergence_confirmed
+            and price_structure_broken
+            and not absorption_risk
+        )
+        if divergence_short_trigger:
+            divergence_score = div_score
+            divergence_flags = ["BEARISH_DIVERGENCE_SHORT"]
+            divergence_contexts = list(div_contexts)
+            _extend_unique(divergence_flags, div_flags)
+            if price_change_24h >= -2.0:
+                divergence_score += 5.0
+            if d_vwap > 1.0:
+                divergence_score += 4.0
+            if funding_hot or oi_hot:
+                divergence_score += 5.0
+            if rejection_confirmed:
+                divergence_score += 5.0
+                _add_unique(divergence_flags, "SHORT_REJECTION_CONFIRMED")
+            divergence_contexts.append(
+                f"✅ Divergence confirmed: {divergence_type} / struct={price_structure_state}"
+            )
+            setup_scores.append(("bearish_divergence_short", divergence_score, divergence_flags, divergence_contexts))
 
     if not setup_scores:
         return 0.0, [], [], [], short_deriv_state

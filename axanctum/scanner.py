@@ -167,6 +167,270 @@ def _calc_cvd_window_state(df, recent_n: int, prior_n: int) -> Dict:
     return state
 
 
+def _classify_cvd_confluence(spot_pct: float, fut_pct: float) -> Dict:
+    """Label arah CVD lokal agar futures-only sell tidak dibaca konfluensi."""
+    min_dir = 0.75
+    strong_spot = 1.2
+
+    spot_bull = spot_pct >= min_dir
+    spot_bear = spot_pct <= -min_dir
+    fut_bull = fut_pct >= min_dir
+    fut_bear = fut_pct <= -min_dir
+
+    direction = "mixed_neutral"
+    divergence = ""
+    if spot_bear and fut_bear:
+        direction = "bearish_cvd_confluence"
+    elif spot_bull and fut_bear:
+        direction = "mixed_divergence"
+        divergence = "spot_bid_vs_perp_sell_divergence"
+    elif spot_bear and fut_bull:
+        direction = "mixed_divergence"
+        divergence = "spot_sell_vs_perp_bid_divergence"
+    elif spot_bull and fut_bull:
+        direction = "bullish_cvd_confluence"
+    elif spot_pct >= strong_spot and fut_pct < 0:
+        direction = "mixed_divergence"
+        divergence = "spot_bid_vs_perp_sell_divergence"
+    elif spot_pct <= -strong_spot and fut_pct > 0:
+        direction = "mixed_divergence"
+        divergence = "spot_sell_vs_perp_bid_divergence"
+
+    return {
+        "direction": direction,
+        "divergence_label": divergence,
+        "spot_bullish_local": spot_pct >= strong_spot,
+        "spot_bearish_local": spot_pct <= -min_dir,
+        "fut_bearish_local": fut_pct <= -min_dir,
+    }
+
+
+def _calc_bearish_divergence_state(
+    fut_df,
+    *,
+    n: int,
+    delta_price: float,
+    delta_price_short: float,
+    d_vwap: float,
+    delta_cvd_spot: float,
+    delta_cvd_fut: float,
+    div_score: float,
+    div_flags: List[str],
+    short_execution: Dict,
+) -> Dict:
+    """Klasifikasi bearish divergence berbasis price structure dan TTL."""
+    state = {
+        "divergence_type": "none",
+        "divergence_status": "none",
+        "price_structure_state": "neutral",
+        "recent_swing_low": 0.0,
+        "recent_swing_high": 0.0,
+        "broke_recent_swing_low": False,
+        "absorption_risk": False,
+        "divergence_age_candles": 0,
+        "short_score_cap_reason": "",
+        "score_cap": None,
+        "score_effective": div_score,
+        "flags": [],
+        "contexts": [],
+    }
+
+    if fut_df is None or len(fut_df) < 8 or div_score <= 0:
+        return state
+
+    structure_n = max(5, min(12, max(4, n // 2)))
+    if len(fut_df) < structure_n + 1:
+        structure_n = max(4, len(fut_df) - 1)
+    if structure_n < 4:
+        return state
+
+    window = fut_df.tail(structure_n + 1).copy()
+    recent = window.tail(structure_n)
+    if len(recent) < 4:
+        return state
+
+    close = float(window["close"].iloc[-1])
+    recent_high = float(recent["high"].max())
+    recent_low = float(recent["low"].min())
+
+    prev_range = window.iloc[:-1]
+    recent_swing_low = float(prev_range["low"].min()) if len(prev_range) else recent_low
+    recent_swing_high = float(prev_range["high"].max()) if len(prev_range) else recent_high
+
+    recent_start = float(window["close"].iloc[0])
+    recent_move = (close - recent_start) / recent_start * 100.0 if recent_start > 0 else 0.0
+    prior_anchor = float(fut_df["close"].iloc[-structure_n - 1]) if len(fut_df) > structure_n else recent_start
+    prior_move = (recent_start - prior_anchor) / prior_anchor * 100.0 if prior_anchor > 0 else 0.0
+    recent_range = (recent_high - recent_low) / close * 100.0 if close > 0 else 0.0
+
+    split_idx = max(2, len(recent) // 2)
+    early_recent = recent.iloc[:split_idx]
+    late_recent = recent.iloc[split_idx:]
+    early_high = float(early_recent["high"].max()) if len(early_recent) else recent_high
+    early_low = float(early_recent["low"].min()) if len(early_recent) else recent_low
+    late_high = float(late_recent["high"].max()) if len(late_recent) else recent_high
+    late_low = float(late_recent["low"].min()) if len(late_recent) else recent_low
+
+    lower_high = bool(late_high < early_high * 0.998)
+    lower_low = bool(late_low < early_low * 0.998)
+    higher_high = bool(late_high > early_high * 1.002)
+    higher_low = bool(late_low > early_low * 1.002)
+
+    range_sideways = bool(
+        abs(recent_move) <= 1.4
+        and recent_range <= max(2.2, abs(prior_move) * 0.65)
+    )
+    broke_recent_swing_low = bool(close < recent_swing_low * 0.997)
+    broke_recent_swing_high = bool(close > recent_swing_high * 1.003)
+
+    price_structure_state = "mixed"
+    if broke_recent_swing_low:
+        price_structure_state = (
+            "lower_high_lower_low" if (lower_high and lower_low) else "breakdown_confirmed"
+        )
+    elif higher_high and higher_low:
+        price_structure_state = "bullish_intact"
+    elif range_sideways:
+        price_structure_state = "range_hold"
+
+    peak_idx = int(recent["high"].to_numpy().argmax())
+    divergence_age_candles = max(0, len(recent) - 1 - peak_idx)
+    ttl_candles = max(4, min(8, structure_n // 2 + 1))
+    price_structure_broken = bool(broke_recent_swing_low)
+    cvd_fading = delta_cvd_spot < 0 or delta_cvd_fut < 0
+    absorption_risk = bool(
+        div_score > 0
+        and cvd_fading
+        and not price_structure_broken
+        and (
+            delta_price >= 0.0
+            or delta_price_short >= -0.1
+            or close >= recent_high * 0.997
+            or bool(short_execution.get("near_24h_high", False))
+        )
+    )
+
+    divergence_type = "bearish_divergence"
+    if delta_cvd_spot > 0 and delta_cvd_fut < 0:
+        divergence_type = "spot_bid_vs_perp_sell_divergence"
+    elif delta_cvd_spot < 0 and delta_cvd_fut > 0:
+        divergence_type = "spot_sell_vs_perp_bid_divergence"
+    elif delta_cvd_spot < 0 and delta_cvd_fut < 0:
+        divergence_type = "bearish_cvd_confluence"
+    elif delta_cvd_spot > 0 and delta_cvd_fut > 0:
+        divergence_type = "bullish_cvd_confluence"
+    if "DIV_HIDDEN_DIST" in div_flags:
+        divergence_type = "hidden_distribution"
+    elif "DIV_FUTURES_DIST" in div_flags:
+        divergence_type = "futures_distribution"
+    elif "DIV_CROSS_MARKET" in div_flags:
+        divergence_type = "cross_market"
+    elif "DIV_VWAP_EXTREME" in div_flags or "DIV_VWAP_DIST" in div_flags:
+        divergence_type = "vwap_premium_exhaustion"
+    elif "DIV_LEVERAGE_TRAP" in div_flags or "DIV_FR_OVERLOAD" in div_flags:
+        divergence_type = "leverage_trap"
+
+    if broke_recent_swing_high or (higher_high and higher_low):
+        status = "invalidated"
+        score_cap = 0.0
+        cap_reason = "bearish_divergence_invalidated_higher_high"
+        contexts = [
+            "❌ Divergence invalidated: harga reclaim / higher high muncul sebelum breakdown",
+        ]
+        flags = ["BEARISH_DIVERGENCE_INVALIDATED"]
+    elif price_structure_broken and cvd_fading:
+        status = "confirmed"
+        score_cap = None
+        cap_reason = "bearish_divergence_confirmed_price_break"
+        contexts = [
+            f"✅ Divergence confirmed: {price_structure_state} + CVD tetap bearish saat breakdown",
+        ]
+        flags = ["BEARISH_DIVERGENCE_CONFIRMED"]
+        if broke_recent_swing_low:
+            flags.append("PRICE_STRUCTURE_BROKEN")
+        if short_execution.get("failed_breakout", False):
+            flags.append("FAILED_RECLAIM_RESISTANCE")
+    elif divergence_age_candles > ttl_candles:
+        status = "stale"
+        score_cap = 12.0 if absorption_risk else 8.0
+        cap_reason = "bearish_divergence_stale_ttl"
+        contexts = [
+            f"🕰️ Divergence stale: {divergence_age_candles} candle tanpa breakdown konfirmasi",
+        ]
+        flags = ["BEARISH_DIVERGENCE_STALE"]
+    else:
+        status = "watch"
+        score_cap = 28.0 if absorption_risk else 30.0
+        cap_reason = "bearish_divergence_watch_no_price_confirmation"
+        contexts = [
+            f"🎭 Bearish divergence watch: {price_structure_state} belum breakdown",
+        ]
+        flags = ["BEARISH_DIVERGENCE_WATCH"]
+
+    if absorption_risk:
+        flags.append("POSSIBLE_SELLER_ABSORPTION")
+        contexts.append("🧲 Price hold/rise while CVD fades — absorption risk, belum confirmed short")
+
+    score_effective = div_score
+    if score_cap is not None:
+        score_effective = min(div_score, score_cap)
+        if status != "confirmed" and div_score > score_effective:
+            contexts.append(f"⏳ Divergence score capped di {score_effective:.1f} karena {cap_reason}")
+
+    state.update({
+        "divergence_type": divergence_type,
+        "divergence_status": status,
+        "price_structure_state": price_structure_state,
+        "recent_swing_low": round(recent_swing_low, 6),
+        "recent_swing_high": round(recent_swing_high, 6),
+        "broke_recent_swing_low": broke_recent_swing_low,
+        "absorption_risk": absorption_risk,
+        "divergence_age_candles": divergence_age_candles,
+        "short_score_cap_reason": cap_reason,
+        "score_cap": score_cap,
+        "score_effective": round(score_effective, 2),
+        "flags": flags,
+        "contexts": contexts,
+    })
+    return state
+
+
+def _calc_short_drop_debug(fut_df, recent_n: int, close: float, d_vwap: float) -> Dict:
+    debug = {
+        "recent_drop_atr": 0.0,
+        "distance_from_vwap_zscore": 0.0,
+    }
+    if fut_df is None or len(fut_df) < recent_n + 1 or close <= 0:
+        return debug
+
+    tail = fut_df.tail(recent_n + 1)
+    start_close = float(tail["close"].iloc[0])
+    recent_drop_pct = (
+        max(0.0, (start_close - close) / start_close * 100.0)
+        if start_close > 0
+        else 0.0
+    )
+
+    true_ranges = []
+    for i in range(1, len(tail)):
+        row = tail.iloc[i]
+        prev_close = float(tail["close"].iloc[i - 1])
+        true_high = max(float(row["high"]), prev_close)
+        true_low = min(float(row["low"]), prev_close)
+        true_ranges.append(max(0.0, true_high - true_low))
+
+    atr_pct = 0.0
+    if true_ranges:
+        atr_pct = sum(true_ranges) / len(true_ranges) / close * 100.0
+    atr_pct = max(0.1, min(atr_pct, 10.0))
+
+    debug.update({
+        "recent_drop_atr": round(recent_drop_pct / atr_pct, 2),
+        "distance_from_vwap_zscore": round(d_vwap / atr_pct, 2),
+    })
+    return debug
+
+
 def _calc_long_phase_state(
     fut_df,
     spot_df,
@@ -422,6 +686,17 @@ def _calc_short_phase_state(
         "spot_cvd": _calc_cvd_window_state(spot_df, recent_n, prior_n),
         "fut_cvd": _calc_cvd_window_state(fut_df, recent_n, prior_n),
         "oi": _calc_oi_window_state(oi_hist, recent_n, prior_n),
+        "debug": {
+            "spot_cvd_slope_short": 0.0,
+            "fut_cvd_slope_short": 0.0,
+            "cvd_confluence_direction": "mixed_neutral",
+            "spot_fut_divergence_label": "",
+            "recent_drop_atr": 0.0,
+            "distance_from_vwap_zscore": 0.0,
+            "oi_phase": "neutral",
+            "bear_expansion_phase": "neutral",
+            "short_veto_reasons": [],
+        },
     }
 
     if fut_df is None or len(fut_df) < recent_n + prior_n + 1:
@@ -430,6 +705,7 @@ def _calc_short_phase_state(
     close = float(fut_df["close"].iloc[-1])
     if close <= 0:
         return state
+    state["debug"].update(_calc_short_drop_debug(fut_df, recent_n, close, d_vwap))
 
     recent = fut_df.tail(recent_n)
     prior_anchor = float(fut_df["close"].iloc[-recent_n - prior_n - 1])
@@ -461,6 +737,16 @@ def _calc_short_phase_state(
     spot = state["spot_cvd"]
     fut = state["fut_cvd"]
     oi = state["oi"]
+    spot_data_available = bool(spot_df is not None and len(spot_df) >= recent_n + prior_n + 1)
+    cvd_local = _classify_cvd_confluence(spot["recent_pct"], fut["recent_pct"])
+    spot_bid_vs_perp_sell = cvd_local["divergence_label"] == "spot_bid_vs_perp_sell_divergence"
+    state["debug"].update({
+        "spot_cvd_slope_short": spot["recent_pct"],
+        "fut_cvd_slope_short": fut["recent_pct"],
+        "cvd_confluence_direction": cvd_local["direction"],
+        "spot_fut_divergence_label": cvd_local["divergence_label"],
+    })
+
     spot_bear_expanding = bool(
         spot["recent_pct"] <= -1.2
         and (not spot["choppy"] or spot["efficiency"] >= 0.50 or spot["recent_pct"] <= -2.5)
@@ -492,8 +778,10 @@ def _calc_short_phase_state(
     )
     bear_cvd_expanding = bool(
         combined_recent_cvd <= -1.4
-        and (spot_bear_expanding or fut_bear_expanding)
+        and fut_bear_expanding
+        and (spot_bear_expanding or not spot_data_available)
         and not bear_cvd_faded
+        and not cvd_local["spot_bullish_local"]
     )
     stale_bear_cvd = bool(
         (
@@ -508,16 +796,62 @@ def _calc_short_phase_state(
             and (fut["flat"] or fut["choppy"])
             or bear_cvd_faded
             or abs(combined_recent_cvd) <= 1.4
+            or spot_bid_vs_perp_sell
         )
     )
     oi_deleveraging = bool(delta_oi <= -2.0 or oi["deleveraging"])
     oi_building = bool(delta_oi >= 1.5 or oi["building"])
     fresh_fuel = bool(oi_building or squeeze_type == "long" or (funding_rate > 0.0001 and delta_oi > -2.0))
+    local_bearish_confluence = bool(
+        cvd_local["fut_bearish_local"]
+        and (cvd_local["spot_bearish_local"] or not spot_data_available)
+    )
     fresh_breakdown = bool(
         breakdown_down
         and bear_cvd_expanding
+        and local_bearish_confluence
         and (fresh_fuel or vol_ratio >= 1.2)
     )
+    recent_drop_large = bool(
+        prior_drop
+        or state["debug"]["recent_drop_atr"] >= 1.5
+        or delta_price <= -2.0
+    )
+    post_dump_spot_absorption = bool(
+        recent_drop_large
+        and near_low
+        and spot_bid_vs_perp_sell
+        and oi_deleveraging
+    )
+    short_veto_reasons: List[str] = []
+    if post_dump_spot_absorption:
+        short_veto_reasons.append("post_dump_spot_absorption_or_bounce_risk")
+
+    oi_phase = "neutral"
+    if oi_building and bear_cvd_expanding:
+        oi_phase = "fresh_short_build"
+    elif oi_deleveraging and fresh_breakdown:
+        oi_phase = "long_liquidation"
+    elif oi_deleveraging:
+        oi_phase = "post_deleveraging"
+
+    bear_expansion_phase = "neutral"
+    if fresh_breakdown:
+        bear_expansion_phase = "early"
+    elif bear_cvd_expanding and breakdown_down:
+        bear_expansion_phase = "active"
+    elif prior_drop and near_low and (range_sideways or oi_deleveraging or spot_bid_vs_perp_sell):
+        bear_expansion_phase = "late"
+    elif bear_cvd_expanding:
+        bear_expansion_phase = "active"
+    elif stale_bear_cvd:
+        bear_expansion_phase = "late"
+
+    state["debug"].update({
+        "oi_phase": oi_phase,
+        "bear_expansion_phase": bear_expansion_phase,
+        "short_veto_reasons": short_veto_reasons,
+    })
 
     if fresh_breakdown:
         state.update({
@@ -528,6 +862,27 @@ def _calc_short_phase_state(
             ],
             "score_mult": 1.04,
             "score_cap": None,
+        })
+        return state
+
+    if post_dump_spot_absorption:
+        state.update({
+            "state": "post_dump_spot_absorption",
+            "flags": [
+                "POST_DROP_EXHAUSTION",
+                "SHORT_TRAP_RISK",
+                "SPOT_BID_PERP_SELL_DIVERGENCE",
+                "POST_DUMP_SPOT_ABSORPTION",
+                "SHORT_FUEL_SPENT",
+            ],
+            "contexts": [
+                f"🧲 Spot bid vs perp sell: Spot CVD {spot['recent_pct']:+.1f}% "
+                f"sementara Futures CVD {fut['recent_pct']:+.1f}%",
+                f"↩️ Post-dump absorption risk: drop {state['debug']['recent_drop_atr']:.2f}x ATR, "
+                f"OI {delta_oi:+.1f}% sudah deleveraging",
+            ],
+            "score_mult": 0.45,
+            "score_cap": 52.0,
         })
         return state
 
@@ -695,6 +1050,12 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
     ls_score = float(r.get("ls_score", 0.0))
     dist_score = float(r.get("dist_score", 0.0))
     div_score = float(r.get("div_score", 0.0))
+    divergence_status = r.get("divergence_status", "none")
+    price_structure_state = r.get("price_structure_state", "neutral")
+    broke_recent_swing_low = bool(r.get("broke_recent_swing_low", False))
+    absorption_risk = bool(r.get("absorption_risk", False))
+    divergence_age_candles = int(r.get("divergence_age_candles", 0))
+    short_score_cap_reason = r.get("short_score_cap_reason", "")
     short_deriv_state = r.get("short_deriv_state", "neutral")
     short_phase_state = r.get("short_phase_state", "neutral")
     short_rejection_score = float(r.get("short_rejection_score", 0.0))
@@ -736,8 +1097,21 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
         or "FRESH_BEAR_EXPANSION" in flags
     )
     post_drop_risk = (
-        short_phase_state in {"post_drop_exhaustion", "short_trap_risk", "short_fuel_spent"}
+        short_phase_state in {
+            "post_drop_exhaustion",
+            "short_trap_risk",
+            "short_fuel_spent",
+            "post_dump_spot_absorption",
+        }
         or bool(flags & {"POST_DROP_EXHAUSTION", "SHORT_TRAP_RISK", "SHORT_FUEL_SPENT"})
+    )
+    spot_bid_perp_sell = bool(
+        "SPOT_BID_PERP_SELL_DIVERGENCE" in flags
+        or r.get("spot_fut_divergence_label") == "spot_bid_vs_perp_sell_divergence"
+    )
+    post_dump_absorption = bool(
+        "POST_DUMP_SPOT_ABSORPTION" in flags
+        or "post_dump_spot_absorption_or_bounce_risk" in r.get("short_veto_reasons", [])
     )
     deriv_support = bool(flags & {
         "SHORT_DERIV_LONG_TRAP",
@@ -876,6 +1250,12 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
     if "SHORT_DERIV_SELL_PRESSURE_ABSORBED" in flags:
         return "watch", ["deriv_sell_pressure_absorbed"]
 
+    if post_dump_absorption:
+        return "watch", ["post_dump_spot_absorption_or_bounce_risk"]
+
+    if spot_bid_perp_sell and setups & trend_setups and delta_oi <= -1.2:
+        return "watch", ["spot_bid_vs_perp_sell_divergence"]
+
     if (
         post_drop_risk
         and setups & {"bear_continuation_short", "breakdown_short"}
@@ -939,6 +1319,22 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
             return "alert", ["bear_continuation_valid", "late_deriv_exception"]
         return "alert", ["bear_continuation_valid"]
 
+    divergence_confirmed_edge = bool(
+        divergence_status == "confirmed"
+        and "bearish_divergence_short" in setups
+        and (
+            broke_recent_swing_low
+            or price_structure_state in {"lower_high_lower_low", "breakdown_confirmed"}
+            or failed_breakout
+            or rejection_confirmed
+        )
+        and not post_drop_risk
+    )
+    if divergence_confirmed_edge:
+        if late_entry or extreme_late:
+            return "watch", ["bearish_divergence_confirmed_late"]
+        return "alert", ["bearish_divergence_confirmed"]
+
     if breakdown_fresh and deriv_edge:
         return "alert", ["breakdown_fresh"]
 
@@ -947,6 +1343,17 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
 
     if setups & top_setups:
         return "watch", ["top_setup_unconfirmed"]
+
+    if divergence_status in {"watch", "stale", "invalidated"} and setups & {
+        "bearish_divergence_watch",
+        "bearish_divergence_short",
+    }:
+        reasons.append(f"bearish_divergence_{divergence_status}")
+        if absorption_risk:
+            reasons.append("possible_seller_absorption")
+        if short_score_cap_reason:
+            reasons.append(short_score_cap_reason)
+        return "watch", reasons
 
     return "watch", reasons or ["quality_gate_watch"]
 
@@ -1179,7 +1586,7 @@ async def scan_coin(
 
             # ── BEARISH DIVERGENCE SHORT SCORE (v2) ───────────────────
             # Pipeline terpisah — tidak mempengaruhi long scoring
-            div_score, div_flags, div_contexts = calc_bearish_divergence_score(
+            div_score_raw, div_flags_raw, div_contexts_raw = calc_bearish_divergence_score(
                 delta_price    = delta_price,
                 delta_cvd_spot = delta_cvd_spot,
                 delta_cvd_fut  = delta_cvd_fut,
@@ -1189,6 +1596,24 @@ async def scan_coin(
                 vol_ratio      = vol_ratio,
                 fr_velocity    = fr_velocity,
             )
+            div_state = _calc_bearish_divergence_state(
+                fut_df,
+                n=N,
+                delta_price=delta_price,
+                delta_price_short=delta_price_short,
+                d_vwap=d_vwap,
+                delta_cvd_spot=delta_cvd_spot,
+                delta_cvd_fut=delta_cvd_fut,
+                div_score=div_score_raw,
+                div_flags=div_flags_raw,
+                short_execution=short_execution,
+            )
+            div_score = float(div_state["score_effective"])
+            div_flags = list(div_flags_raw)
+            for flag in div_state["flags"]:
+                if flag not in div_flags:
+                    div_flags.append(flag)
+            div_contexts = list(div_contexts_raw) + list(div_state["contexts"])
 
             # ── INTEGRATED SHORT SCORE ────────────────────────────────
             # Cabang short mandiri: LS/DIST/DIV lama tetap dipakai sebagai
@@ -1214,6 +1639,13 @@ async def scan_coin(
                 div_score         = div_score,
                 div_flags         = div_flags,
                 div_contexts      = div_contexts,
+                divergence_type   = div_state["divergence_type"],
+                divergence_status = div_state["divergence_status"],
+                price_structure_state = div_state["price_structure_state"],
+                broke_recent_swing_low = div_state["broke_recent_swing_low"],
+                absorption_risk   = div_state["absorption_risk"],
+                divergence_age_candles = div_state["divergence_age_candles"],
+                short_score_cap_reason = div_state["short_score_cap_reason"],
                 short_rejection_score = short_execution["short_rejection_score"],
                 failed_breakout       = short_execution["failed_breakout"],
                 last_candle_bearish   = short_execution["last_candle_bearish"],
@@ -1243,6 +1675,28 @@ async def scan_coin(
                 )
             else:
                 short_targets = {}
+
+            short_debug = short_phase.get("debug", {})
+            short_debug_str = ""
+            if short_score > 0 or short_phase["state"] != "neutral":
+                short_debug_str = (
+                    f" │ CVDdir:{short_debug.get('cvd_confluence_direction', 'mixed_neutral')}"
+                    f" Div:{short_debug.get('spot_fut_divergence_label') or '-'}"
+                    f" OIph:{short_debug.get('oi_phase', 'neutral')}"
+                    f" BExp:{short_debug.get('bear_expansion_phase', 'neutral')}"
+                    f" DropATR:{short_debug.get('recent_drop_atr', 0.0):.2f}"
+                    f" VWAPz:{short_debug.get('distance_from_vwap_zscore', 0.0):.2f}"
+                    f" Veto:{','.join(short_debug.get('short_veto_reasons', [])) or '-'}"
+                )
+            div_debug_str = ""
+            if div_score_raw > 0:
+                div_debug_str = (
+                    f" │ DivStat:{div_state['divergence_status']}"
+                    f" Type:{div_state['divergence_type']}"
+                    f" Struct:{div_state['price_structure_state']}"
+                    f" Age:{div_state['divergence_age_candles']}"
+                    f" Cap:{div_state['short_score_cap_reason'] or '-'}"
+                )
 
             # Volume anomaly langsung memodifikasi skor akhir
             # Sinyal kuat + volume sepi = kurang konvinsif
@@ -1279,7 +1733,7 @@ async def scan_coin(
                 f"CVDf:{delta_cvd_fut:>+5.1f}% "
                 f"OI:{delta_oi:>+5.2f}% "
                 f"FR:{fr_pct:>+6.4f}% │ "
-                f"{flags_str}"
+                f"{flags_str}{short_debug_str}{div_debug_str}"
             )
             
             return {
@@ -1325,9 +1779,19 @@ async def scan_coin(
                 "dist_flags":    dist_flags,
                 "dist_contexts": dist_contexts,
                 # ── divergence short fields (v2) ───────────────────────
+                "div_score_raw": div_score_raw,
                 "div_score":     div_score,
                 "div_flags":     div_flags,
                 "div_contexts":  div_contexts,
+                "divergence_status": div_state["divergence_status"],
+                "divergence_type": div_state["divergence_type"],
+                "price_structure_state": div_state["price_structure_state"],
+                "recent_swing_low": div_state["recent_swing_low"],
+                "recent_swing_high": div_state["recent_swing_high"],
+                "broke_recent_swing_low": div_state["broke_recent_swing_low"],
+                "absorption_risk": div_state["absorption_risk"],
+                "divergence_age_candles": div_state["divergence_age_candles"],
+                "short_score_cap_reason": div_state["short_score_cap_reason"],
                 # ── integrated short branch ────────────────────────────
                 "short_score":    short_score,
                 "short_flags":    short_flags,
@@ -1341,6 +1805,15 @@ async def scan_coin(
                 "short_spot_cvd_phase": short_phase["spot_cvd"],
                 "short_fut_cvd_phase": short_phase["fut_cvd"],
                 "short_oi_phase": short_phase["oi"],
+                "spot_cvd_slope_short": short_debug.get("spot_cvd_slope_short", 0.0),
+                "fut_cvd_slope_short": short_debug.get("fut_cvd_slope_short", 0.0),
+                "cvd_confluence_direction": short_debug.get("cvd_confluence_direction", "mixed_neutral"),
+                "spot_fut_divergence_label": short_debug.get("spot_fut_divergence_label", ""),
+                "recent_drop_atr": short_debug.get("recent_drop_atr", 0.0),
+                "distance_from_vwap_zscore": short_debug.get("distance_from_vwap_zscore", 0.0),
+                "oi_phase": short_debug.get("oi_phase", "neutral"),
+                "bear_expansion_phase": short_debug.get("bear_expansion_phase", "neutral"),
+                "short_veto_reasons": short_debug.get("short_veto_reasons", []),
                 "short_rejection_score": short_execution["short_rejection_score"],
                 "failed_breakout":       short_execution["failed_breakout"],
                 "last_candle_bearish":   short_execution["last_candle_bearish"],
@@ -1542,7 +2015,7 @@ async def run_scan_batch(
         "bear_continuation_short", "breakdown_short",
         "long_squeeze_short", "distribution_short",
         "bearish_divergence_short", "exhaustion_after_pump_short",
-        "top_reversal_short",
+        "top_reversal_short", "bearish_divergence_watch",
     }
     _long_setups_ok  = bool(_LONG_SETUP_TYPES  & set(regime_ctx.allowed_setups))
     # SHORT boleh dievaluasi di semua regime non-PANIC; keketatannya diatur
