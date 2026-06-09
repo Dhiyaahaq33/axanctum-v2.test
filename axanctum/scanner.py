@@ -1081,6 +1081,126 @@ def _has_bearish_breadth_recovery_exception(r: Dict) -> bool:
     return bool(cvd_recovery and squeeze_reversal and clean_location and volume_ok)
 
 
+def _calc_short_regime_adjustment(r: Dict, regime_ctx, pre_euphoric_guard: bool) -> tuple[float, List[str]]:
+    """Setup-aware short regime adjustment."""
+    short_setups = set(r.get("short_setups", []))
+    short_flags = set(r.get("short_flags", []))
+
+    price24 = float(r.get("price_change_24h", 0.0))
+    d_vwap = float(r.get("d_vwap", 0.0))
+    delta_price_short = float(r.get("delta_price_short", 0.0))
+    delta_cvd_spot = float(r.get("delta_cvd_spot", 0.0))
+    delta_cvd_fut = float(r.get("delta_cvd_fut", 0.0))
+    delta_oi = float(r.get("delta_oi", 0.0))
+    funding_rate = float(r.get("funding_rate", 0.0))
+    vol_ratio = float(r.get("vol_ratio", 1.0))
+    dist_score = float(r.get("dist_score", 0.0))
+    div_score = float(r.get("div_score", 0.0))
+    short_deriv_state = r.get("short_deriv_state", "neutral")
+    short_phase_state = r.get("short_phase_state", "neutral")
+    rejection_confirmed = bool(r.get("short_rejection_score", 0.0) >= 55.0 or r.get("failed_breakout", False))
+    spot_absorption_risk = bool(r.get("spot_absorption_risk", False))
+    micro_reversal_trigger = "MICRO_REVERSAL_TRIGGER" in short_flags
+    late_continuation_chase = bool(
+        price24 <= -8.0
+        and d_vwap <= -4.0
+        and short_setups & {"bear_continuation_short", "breakdown_short"}
+        and not (short_setups & {"top_reversal_short", "exhaustion_after_pump_short", "distribution_short", "bearish_divergence_short"})
+    )
+
+    top_family = {
+        "top_reversal_short",
+        "exhaustion_after_pump_short",
+        "distribution_short",
+        "bearish_divergence_short",
+    }
+    trend_family = {"bear_continuation_short", "breakdown_short", "long_squeeze_short"}
+    adj = 0.0
+    reasons: List[str] = []
+
+    if pre_euphoric_guard:
+        adj += 2.0
+        reasons.append("pre_euphoric_guard")
+
+    if regime_ctx.regime == "EUPHORIC":
+        if short_setups & top_family:
+            adj += 6.0
+            reasons.append("euphoric_top_short")
+        if "bearish_divergence_watch" in short_setups or micro_reversal_trigger:
+            adj += 3.0
+            reasons.append("euphoric_reversal_watch")
+        if short_setups & trend_family:
+            adj -= 3.0
+            reasons.append("euphoric_trend_short_penalty")
+
+    elif regime_ctx.regime == "TRENDING":
+        if short_setups & top_family:
+            adj += 2.0
+            reasons.append("trending_top_short")
+        if micro_reversal_trigger or spot_absorption_risk or (dist_score >= 35.0 and div_score >= 30.0):
+            adj += 2.0
+            reasons.append("trending_micro_reversal_support")
+        if short_setups & {"bear_continuation_short", "breakdown_short"}:
+            adj -= 4.0
+            reasons.append("trending_continuation_penalty")
+        if short_setups & {"long_squeeze_short"}:
+            adj -= 2.0
+            reasons.append("trending_long_squeeze_penalty")
+
+    elif regime_ctx.regime == "CHOP":
+        if short_setups & top_family:
+            adj += 3.0
+            reasons.append("chop_top_short")
+        if short_setups & {"bearish_divergence_watch"}:
+            adj += 2.0
+            reasons.append("chop_divergence_watch")
+        if micro_reversal_trigger or spot_absorption_risk:
+            adj += 2.0
+            reasons.append("chop_micro_reversal_support")
+        if short_setups & {"bear_continuation_short", "breakdown_short", "long_squeeze_short"}:
+            adj -= 6.0
+            reasons.append("chop_continuation_penalty")
+
+    elif regime_ctx.regime == "RECOVERY":
+        if short_setups & top_family and rejection_confirmed and (dist_score >= 55.0 or div_score >= 45.0):
+            adj -= 1.0
+            reasons.append("recovery_confirmed_top_soft_penalty")
+        elif short_setups & top_family:
+            adj -= 4.0
+            reasons.append("recovery_top_penalty")
+        if micro_reversal_trigger or spot_absorption_risk:
+            adj -= 1.0
+            reasons.append("recovery_micro_reversal_penalty")
+        if short_setups & {"bear_continuation_short", "breakdown_short", "long_squeeze_short"}:
+            adj -= 9.0
+            reasons.append("recovery_continuation_penalty")
+        if short_setups & {"bearish_divergence_watch"}:
+            adj -= 3.0
+            reasons.append("recovery_divergence_watch_penalty")
+
+    if late_continuation_chase:
+        adj -= 4.0
+        reasons.append("late_continuation_chase")
+
+    if short_phase_state in {"post_drop_exhaustion", "short_trap_risk", "short_fuel_spent"}:
+        if short_setups & trend_family:
+            adj -= 3.0
+            reasons.append("post_drop_trend_penalty")
+    if short_deriv_state in {"breakout_fuel", "late_deleveraging", "local_bounce_risk", "sell_pressure_absorbed"}:
+        if short_setups & top_family:
+            adj += 1.0
+            reasons.append(f"deriv_{short_deriv_state}_top_support")
+
+    # micro reversal di area atas seharusnya membantu top family, bukan continuation
+    if micro_reversal_trigger and short_setups & top_family:
+        adj += 2.0
+        reasons.append("micro_reversal_top_support")
+
+    # Small clamp supaya regime tidak mendominasi total score
+    adj = max(-12.0, min(10.0, adj))
+    return adj, reasons
+
+
 def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[str]]:
     """
     Quality gate akhir untuk SHORT alert.
@@ -1910,6 +2030,7 @@ async def scan_coin(
                 "short_score":    short_score,
                 "short_flags":    short_flags,
                 "short_contexts": short_contexts,
+                "short_regime_reasons": r.get("short_regime_reasons", []),
                 "short_setups":   short_setups,
                 "short_targets":  short_targets,
                 "short_deriv_state": short_deriv_state,
@@ -2083,38 +2204,19 @@ async def run_scan_batch(
     # Apply regime ke cabang short mandiri.
     for r in results:
         short_base = float(r.get("short_score", 0.0))
-        short_adj = 0.0
-        short_setups = set(r.get("short_setups", []))
 
         if short_base <= 0:
             r["short_score_regime_adj"] = 0.0
+            r["short_regime_reasons"] = []
             continue
 
-        if _pre_euphoric_guard:
-            short_adj += 3.0
-
-        if regime_ctx.regime == "EUPHORIC":
-            if short_setups & {
-                "top_reversal_short",
-                "exhaustion_after_pump_short",
-                "bearish_divergence_short",
-                "distribution_short",
-                "long_squeeze_short",
-            }:
-                short_adj += 5.0
-        elif regime_ctx.regime == "TRENDING":
-            if short_setups & {"bear_continuation_short", "breakdown_short"}:
-                short_adj -= 3.0
-        elif regime_ctx.regime == "CHOP":
-            if short_setups & {"bear_continuation_short", "breakdown_short"}:
-                short_adj -= 4.0
-        elif regime_ctx.regime == "RECOVERY":
-            if short_setups & {"bear_continuation_short", "breakdown_short", "long_squeeze_short"}:
-                short_adj -= 8.0
-            else:
-                short_adj -= 4.0
-
+        short_adj, short_reasons = _calc_short_regime_adjustment(
+            r,
+            regime_ctx,
+            _pre_euphoric_guard,
+        )
         r["short_score_regime_adj"] = round(max(0.0, min(100.0, short_base + short_adj)), 1)
+        r["short_regime_reasons"] = short_reasons
 
     # ── Gate per tipe setup — pisah long vs short ──────────────────────
     # Sebelumnya satu gate untuk semua, menyebabkan regime EUPHORIC

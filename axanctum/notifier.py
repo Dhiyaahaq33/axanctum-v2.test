@@ -376,14 +376,23 @@ def build_telegram_message(r: Dict, signal_type: str = "LONG", regime_ctx=None) 
     sep = "─" * 34
 
     # Baris regime adj — tampilkan hanya kalau ada perbedaan dengan score asli
-    score_adj = r.get("score_regime_adj", score) if signal_type == "LONG" else score
-    if regime_ctx and abs(score_adj - score) >= 0.5:
-        diff     = score_adj - score
+    if signal_type == "LONG":
+        score_base = score
+        score_adj = r.get("score_regime_adj", score)
+    else:
+        score_base = r.get("short_score", score)
+        score_adj = r.get("short_score_regime_adj", score)
+
+    if regime_ctx:
+        diff = score_adj - score_base
         diff_str = f"+{diff:.1f}" if diff > 0 else f"{diff:.1f}"
-        regime_line = (
-            f"<i>┗ Regime adj: {score:.1f} {diff_str} = {score_adj:.1f} "
-            f"({regime_ctx.regime})</i>"
-        )
+        if abs(diff) >= 0.5:
+            regime_line = (
+                f"<i>┗ Regime adj: {score_base:.1f} {diff_str} = {score_adj:.1f} "
+                f"({regime_ctx.regime})</i>"
+            )
+        else:
+            regime_line = f"<i>┗ Regime: {regime_ctx.regime}</i>"
     else:
         regime_line = ""
 
