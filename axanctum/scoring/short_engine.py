@@ -662,6 +662,7 @@ def calc_integrated_short_score(
     last_close_position: float = 0.5,
     upper_wick_pct: float = 0.0,
     near_24h_high: bool = False,
+    spot_absorption_risk: bool = False,
 ) -> Tuple[float, List[str], List[str], List[str], str]:
     """
     Integrated SHORT decision branch.
@@ -750,6 +751,41 @@ def calc_integrated_short_score(
         "bear_continuation_fresh",
         "long_squeeze_fuel",
     }
+    top_location = bool(
+        near_24h_high
+        or d_vwap >= 2.0
+        or price_change_24h >= 3.0
+        or delta_price >= 1.2
+    )
+    price_failed_to_extend = bool(
+        failed_breakout
+        or short_rejection_score >= 38.0
+        or delta_price_short <= -0.25
+        or (last_candle_bearish and last_close_position <= 0.62)
+        or (upper_wick_pct >= 0.25 and last_close_position <= 0.65)
+    )
+    cvd_top_pressure = bool(
+        delta_cvd_spot <= -0.75
+        or delta_cvd_fut <= -0.75
+        or dist_score >= 35.0
+        or div_score >= 30.0
+        or spot_absorption_risk
+        or short_deriv_state in {"long_trap", "buy_pressure_absorbed"}
+    )
+    early_top_heat = bool(
+        funding_positive
+        or delta_oi >= 1.5
+        or dist_score >= 35.0
+        or div_score >= 30.0
+        or short_deriv_state in {"long_trap", "buy_pressure_absorbed"}
+    )
+    micro_reversal_trigger = bool(
+        top_location
+        and price_failed_to_extend
+        and cvd_top_pressure
+        and (early_top_heat or strong_bear_flow)
+        and vol_ratio >= 0.6
+    )
 
     # ── 1) Bear continuation: cocok untuk tape bearish sepanjang hari ──
     bear_score = 0.0
@@ -850,6 +886,7 @@ def calc_integrated_short_score(
         delta_price <= 0.0
         or delta_price_short <= -0.35
         or rejection_confirmed
+        or micro_reversal_trigger
         or strong_bear_flow
         or short_deriv_state in {"long_trap", "buy_pressure_absorbed"}
     )
@@ -864,6 +901,10 @@ def calc_integrated_short_score(
             distribution_score += 6.0
         if funding_positive:
             distribution_score += 4.0
+        if micro_reversal_trigger:
+            distribution_score += 6.0
+            _add_unique(distribution_flags, "MICRO_REVERSAL_TRIGGER")
+            distribution_contexts.append("🧱 Micro reversal: buyer gagal extend di area atas")
         if rejection_confirmed:
             distribution_score += 5.0
             _add_unique(distribution_flags, "SHORT_REJECTION_CONFIRMED")
@@ -877,10 +918,12 @@ def calc_integrated_short_score(
     exhaustion_evidence = (
         dist_score > 0
         or (divergence_confirmed and div_score > 0)
+        or (divergence_watch and div_score >= 30.0)
+        or spot_absorption_risk
         or delta_cvd_spot < -1.0
         or delta_cvd_fut < -1.0
     )
-    if pumpish and exhaustion_evidence and soft_rejection:
+    if pumpish and exhaustion_evidence and (soft_rejection or micro_reversal_trigger):
         pump_ref = max(price_change_24h, delta_price, d_vwap)
         exhaustion_score = 26.0 + min(max(pump_ref, 0.0) / 8.0, 1.0) * 12.0
         exhaustion_flags = ["EXHAUSTION_AFTER_PUMP_SHORT"]
@@ -893,6 +936,10 @@ def calc_integrated_short_score(
             exhaustion_contexts.append(
                 f"🧱 Candle/failed breakout confirm — rejection {short_rejection_score:.0f}/100"
             )
+        elif micro_reversal_trigger:
+            exhaustion_score += 5.0
+            _add_unique(exhaustion_flags, "MICRO_REVERSAL_TRIGGER")
+            exhaustion_contexts.append("🧱 Micro rejection cukup untuk early exhaustion watch")
         if dist_score > 0:
             exhaustion_score += min(dist_score * 0.25, 12.0)
             _extend_unique(exhaustion_flags, dist_flags)
@@ -910,6 +957,13 @@ def calc_integrated_short_score(
         and d_vwap >= 2.0
     )
     top_flow_break = delta_cvd_spot < -1.0 and delta_cvd_fut < 1.5
+    top_flow_break = bool(
+        top_flow_break
+        or spot_absorption_risk
+        or short_deriv_state in {"long_trap", "buy_pressure_absorbed"}
+        or dist_score >= 45.0
+        or (divergence_watch and div_score >= 30.0)
+    )
     top_deriv_heat = (
         funding_hot
         or oi_hot
@@ -917,7 +971,19 @@ def calc_integrated_short_score(
         or (divergence_confirmed and div_score >= 45.0)
         or short_deriv_state in {"long_trap", "buy_pressure_absorbed"}
     )
-    if top_reversal_context and top_flow_break and top_deriv_heat and rejection_confirmed:
+    early_top_deriv_heat = bool(
+        top_deriv_heat
+        or (funding_positive and delta_oi >= 1.0)
+        or dist_score >= 45.0
+        or div_score >= 45.0
+        or spot_absorption_risk
+    )
+    if (
+        top_reversal_context
+        and top_flow_break
+        and early_top_deriv_heat
+        and (rejection_confirmed or micro_reversal_trigger)
+    ):
         top_score = 36.0
         top_score += min(max(d_vwap, 0.0) / 8.0, 1.0) * 10.0
         top_score += min(max(price_change_24h, delta_price, 0.0) / 12.0, 1.0) * 8.0
@@ -934,6 +1000,10 @@ def calc_integrated_short_score(
             top_score += 8.0
             _add_unique(top_flags, "FAILED_BREAKOUT_SHORT")
             top_contexts.append("🚫 Failed breakout: high baru gagal dipertahankan")
+        if micro_reversal_trigger:
+            top_score += 9.0
+            _add_unique(top_flags, "MICRO_REVERSAL_TRIGGER")
+            top_contexts.append("🧱 Micro reversal trigger: pucuk gagal extend sebelum dump besar")
         if delta_cvd_spot < -1.0:
             top_score += 6.0
             _add_unique(top_flags, "DIV_HIDDEN_DIST")
@@ -946,6 +1016,9 @@ def calc_integrated_short_score(
         if div_score > 0 and divergence_confirmed:
             top_score += min(div_score * 0.20, 10.0)
             _extend_unique(top_flags, div_flags)
+        if spot_absorption_risk:
+            top_score += 5.0
+            _add_unique(top_flags, "BUY_PRESSURE_ABSORBED")
         setup_scores.append(("top_reversal_short", top_score, top_flags, top_contexts))
 
     # ── 6) Bearish divergence: watch dulu, confirm hanya jika struktur pecah ─
@@ -1009,6 +1082,25 @@ def calc_integrated_short_score(
     if not setup_scores:
         return 0.0, [], [], [], short_deriv_state
 
+    if micro_reversal_trigger:
+        top_family = {
+            "top_reversal_short",
+            "exhaustion_after_pump_short",
+            "distribution_short",
+            "bearish_divergence_short",
+        }
+        boosted_scores: List[Tuple[str, float, List[str], List[str]]] = []
+        for name, item_score, item_flags, item_contexts in setup_scores:
+            if name in top_family:
+                item_score += 4.0
+                if "MICRO_REVERSAL_TRIGGER" not in item_flags:
+                    item_flags = list(item_flags) + ["MICRO_REVERSAL_TRIGGER"]
+                item_contexts = list(item_contexts) + [
+                    "🎯 Reversal diprioritaskan karena trigger muncul di area atas"
+                ]
+            boosted_scores.append((name, item_score, item_flags, item_contexts))
+        setup_scores = boosted_scores
+
     setup_scores.sort(key=lambda x: x[1], reverse=True)
     primary_setup, score, flags, contexts = setup_scores[0]
     setups = [name for name, _, _, _ in setup_scores]
@@ -1066,6 +1158,7 @@ def calc_integrated_short_score(
     if (
         primary_setup in ("top_reversal_short", "exhaustion_after_pump_short")
         and not rejection_confirmed
+        and not micro_reversal_trigger
     ):
         score *= 0.70
         contexts.append("⏳ Top short belum punya rejection trigger penuh")

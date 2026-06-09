@@ -33,7 +33,11 @@ from .notifier import (
     send_signal_to_dashboard,
     send_telegram,
 )
-from .scoring.long_engine import calculate_market_score
+from .scoring.long_engine import (
+    calculate_market_score,
+    classify_spot_accumulation_quality,
+    classify_short_squeeze_quality,
+)
 from .scoring.breadth import calculate_market_breadth, format_market_breadth_log
 from .scoring.regime_engine import get_regime_engine
 from .scoring.short_engine import (
@@ -444,6 +448,7 @@ def _calc_long_phase_state(
     delta_oi: float,
     funding_rate: float,
     squeeze_type: str,
+    squeeze_fuel: float,
     delta_cvd_fut: float,
 ) -> Dict:
     """
@@ -462,6 +467,15 @@ def _calc_long_phase_state(
         "score_cap": None,
         "spot_cvd": _calc_cvd_window_state(spot_df, recent_n, prior_n),
         "fut_cvd": _calc_cvd_window_state(fut_df, recent_n, prior_n),
+        "debug": {
+            "downtrend_context": False,
+            "post_rally_context": False,
+            "price_reclaim_or_breakout": False,
+            "short_squeeze_setup_score": 0.0,
+            "short_squeeze_confirmation_score": 0.0,
+            "short_squeeze_veto_reasons": [],
+            "allow_short_squeeze_boost": False,
+        },
     }
 
     if fut_df is None or len(fut_df) < recent_n + prior_n + 1:
@@ -490,11 +504,18 @@ def _calc_long_phase_state(
     lookback_24h = max(3, min(candles_24h, len(fut_df)))
     high_24h = float(fut_df.tail(lookback_24h)["high"].max())
     near_24h_high = bool(high_24h > 0 and recent_high >= high_24h * 0.97)
+    downtrend_context = bool(
+        price_change_24h <= -3.0
+        or prior_move <= -2.5
+        or delta_price <= -0.75
+        or d_vwap <= -1.0
+    )
     rally_context = bool(
         (price_change_24h >= 6.0 or prior_move >= 4.0 or delta_price >= 3.0)
         and near_24h_high
     )
     post_rally = bool(rally_context and d_vwap >= 1.2)
+    post_rally_context = bool(rally_context or post_rally)
     range_sideways = bool(abs(recent_move) <= 2.0 and recent_range <= max(1.8, abs(prior_move) * 0.75))
 
     prev_range = fut_df.iloc[-recent_n - 1:-1]
@@ -502,6 +523,7 @@ def _calc_long_phase_state(
     range_low = float(prev_range["low"].min()) if len(prev_range) else recent_low
     breakout_up = bool(close > range_high * 1.003)
     breakdown_down = bool(close < range_low * 0.997)
+    price_reclaim_or_breakout = bool(breakout_up or (delta_price_short > 0.25 and delta_price > 0))
 
     spot = state["spot_cvd"]
     fut = state["fut_cvd"]
@@ -513,7 +535,6 @@ def _calc_long_phase_state(
     spot_pause = bool(spot["flat"] or spot["choppy"])
     fut_confirm = bool(fut["recent_pct"] >= 1.0 or delta_cvd_fut > 1.0)
     short_closing = bool(squeeze_type == "short" and delta_oi < -1.5 and delta_price_short > 0.3)
-    confirmed_squeeze = bool(post_rally and breakout_up and spot_expanding and (fut_confirm or short_closing))
     lower_high = bool(late_high < early_high * 0.998)
     lower_low = bool(late_low < early_low * 0.998)
     local_rollover = bool(
@@ -532,16 +553,49 @@ def _calc_long_phase_state(
             and combined_recent_cvd <= -1.0
         )
     )
+    squeeze_quality = classify_short_squeeze_quality(
+        squeeze_type=squeeze_type,
+        squeeze_fuel=squeeze_fuel,
+        funding_rate=funding_rate,
+        delta_oi=delta_oi,
+        delta_price=delta_price,
+        price_change_24h=price_change_24h,
+        delta_price_short=delta_price_short,
+        price_reclaim_or_breakout=price_reclaim_or_breakout,
+        post_rally_context=post_rally_context,
+        downtrend_context_hint=downtrend_context,
+    )
+    state["debug"].update({
+        "downtrend_context": downtrend_context,
+        "post_rally_context": post_rally_context,
+        "price_reclaim_or_breakout": price_reclaim_or_breakout,
+        "short_squeeze_setup_score": squeeze_quality["short_squeeze_setup_score"],
+        "short_squeeze_confirmation_score": squeeze_quality["short_squeeze_confirmation_score"],
+        "short_squeeze_veto_reasons": squeeze_quality["short_squeeze_veto_reasons"],
+        "allow_short_squeeze_boost": squeeze_quality["allow_short_squeeze_boost"],
+    })
 
-    if confirmed_squeeze:
+    if squeeze_type == "short" and squeeze_quality["allow_short_squeeze_boost"] and price_reclaim_or_breakout:
         state.update({
             "state": "confirmed_squeeze",
             "flags": ["CONFIRMED_SHORT_SQUEEZE"],
             "contexts": [
-                f"✅ Confirmed squeeze: breakout range + Spot CVD {spot['recent_pct']:+.1f}% ekspansif"
+                f"✅ Confirmed short squeeze: downtrend rebound + reclaim/breakout, Spot CVD {spot['recent_pct']:+.1f}%"
             ],
             "score_mult": 1.05,
             "score_cap": None,
+        })
+        return state
+
+    if squeeze_type == "short" and post_rally_context and not squeeze_quality["allow_short_squeeze_boost"]:
+        state.update({
+            "state": "squeeze_watch",
+            "flags": ["SQUEEZE_WATCH"],
+            "contexts": [
+                "🔫 Short squeeze watch: post-rally context belum cukup untuk konfirmasi"
+            ],
+            "score_mult": 0.82,
+            "score_cap": 66.0,
         })
         return state
 
@@ -612,7 +666,7 @@ def _calc_long_phase_state(
         })
         return state
 
-    if funding_rate < 0 and post_rally and not confirmed_squeeze:
+    if funding_rate < 0 and post_rally and not (squeeze_type == "short" and squeeze_quality["allow_short_squeeze_boost"]):
         state.update({
             "state": "squeeze_watch",
             "flags": ["SQUEEZE_WATCH"],
@@ -1063,6 +1117,8 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
     last_candle_bearish = bool(r.get("last_candle_bearish", False))
     last_close_position = float(r.get("last_close_position", 0.5))
     near_24h_high = bool(r.get("near_24h_high", False))
+    spot_absorption_risk = bool(r.get("spot_absorption_risk", False))
+    micro_reversal_trigger = "MICRO_REVERSAL_TRIGGER" in flags
 
     top_setups = {
         "top_reversal_short",
@@ -1118,6 +1174,7 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
         "SHORT_DERIV_BUY_PRESSURE_ABSORBED",
         "SHORT_DERIV_BEAR_CONTINUATION_FRESH",
         "SHORT_DERIV_LONG_SQUEEZE_FUEL",
+        "BUY_PRESSURE_ABSORBED",
     })
     deriv_edge = (
         strong_bear_flow
@@ -1138,6 +1195,12 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
     )
 
     late_entry = price24 <= -14.0 and d_vwap <= -7.0
+    late_continuation_chase = (
+        price24 <= -8.0
+        and d_vwap <= -4.0
+        and setups & {"bear_continuation_short", "breakdown_short"}
+        and not (setups & top_setups)
+    )
     extreme_late = price24 <= -20.0 or d_vwap <= -11.0
     exhausted_deriv = (
         delta_oi <= -8.0
@@ -1177,18 +1240,28 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
     )
     top_flow = (
         delta_cvd_spot < -1.0 and delta_cvd_fut < 1.0
-    ) or div_score >= 50.0 or dist_score >= 55.0
+    ) or div_score >= 50.0 or dist_score >= 55.0 or spot_absorption_risk or micro_reversal_trigger
     top_deriv = (
         funding_rate > 0.0005
         or delta_oi > 4.0
         or dist_score >= 70.0
         or div_score >= 70.0
         or deriv_support
+        or (
+            micro_reversal_trigger
+            and (
+                funding_rate > 0.0001
+                or delta_oi >= 1.0
+                or dist_score >= 45.0
+                or div_score >= 45.0
+                or spot_absorption_risk
+            )
+        )
     )
     top_valid = bool(
         setups & top_setups
         and top_context
-        and rejection_confirmed
+        and (rejection_confirmed or micro_reversal_trigger)
         and top_flow
         and (top_deriv or strong_bear_flow)
         and vol_ratio >= 0.7
@@ -1272,6 +1345,9 @@ def _short_gate_decision(r: Dict, regime_ctx, breadth_ctx) -> tuple[str, List[st
 
     if deep_distribution:
         reasons.append("distribution_not_top")
+
+    if late_continuation_chase and not active_late_edge:
+        return "watch", reasons + ["late_continuation_chase"]
 
     if late_entry and not active_late_edge:
         reasons.append("late_entry")
@@ -1471,8 +1547,16 @@ async def scan_coin(
                 delta_oi=delta_oi,
                 funding_rate=fr,
                 squeeze_type=squeeze_type,
+                squeeze_fuel=squeeze_fuel,
                 delta_cvd_fut=delta_cvd_fut,
             )
+            spot_quality = classify_spot_accumulation_quality(
+                spot_cvd_slope_short=delta_cvd_spot,
+                price_slope_short=delta_price_short,
+                post_rally_context=bool(long_phase.get("debug", {}).get("post_rally_context", False)),
+                price_reclaim_or_breakout=bool(long_phase.get("debug", {}).get("price_reclaim_or_breakout", False)),
+            )
+            long_phase.setdefault("debug", {}).update(spot_quality)
 
             short_phase = _calc_short_phase_state(
                 fut_df,
@@ -1502,6 +1586,9 @@ async def scan_coin(
                 fr_velocity    = fr_velocity,
                 vol_ratio      = vol_ratio,
                 squeeze_type   = squeeze_type,
+                allow_short_squeeze_boost = bool(long_phase.get("debug", {}).get("allow_short_squeeze_boost", False)),
+                spot_state     = str(spot_quality.get("spot_state", "neutral_or_no_spot_accum")),
+                spot_accum_score_cap = spot_quality.get("long_score_cap"),
             )
             
             # ── ABSORPTION DETECTION ───────────────────────────────────
@@ -1652,6 +1739,7 @@ async def scan_coin(
                 last_close_position   = short_execution["last_close_position"],
                 upper_wick_pct        = short_execution["upper_wick_pct"],
                 near_24h_high         = short_execution["near_24h_high"],
+                spot_absorption_risk  = bool(spot_quality.get("spot_absorption_risk", False)),
             )
 
             if short_score > 0 and short_phase["flags"]:
@@ -1675,6 +1763,21 @@ async def scan_coin(
                 )
             else:
                 short_targets = {}
+
+            long_debug = long_phase.get("debug", {})
+            long_debug_str = ""
+            if squeeze_type == "short" or long_phase["state"] != "neutral":
+                long_debug_str = (
+                    f" │ SqDn:{long_debug.get('downtrend_context', False)}"
+                    f" Reclaim:{long_debug.get('price_reclaim_or_breakout', False)}"
+                    f" Sq:{long_debug.get('short_squeeze_setup_score', 0.0):.0f}/"
+                    f"{long_debug.get('short_squeeze_confirmation_score', 0.0):.0f}"
+                    f" Boost:{long_debug.get('allow_short_squeeze_boost', False)}"
+                    f" SVeto:{','.join(long_debug.get('short_squeeze_veto_reasons', [])) or '-'}"
+                    f" Spot:{long_debug.get('spot_state', 'neutral_or_no_spot_accum')}"
+                    f" Resp:{long_debug.get('price_response_to_spot_cvd', 'neutral')}"
+                    f" LCap:{long_debug.get('long_score_cap_reason') or '-'}"
+                )
 
             short_debug = short_phase.get("debug", {})
             short_debug_str = ""
@@ -1733,7 +1836,7 @@ async def scan_coin(
                 f"CVDf:{delta_cvd_fut:>+5.1f}% "
                 f"OI:{delta_oi:>+5.2f}% "
                 f"FR:{fr_pct:>+6.4f}% │ "
-                f"{flags_str}{short_debug_str}{div_debug_str}"
+                f"{flags_str}{long_debug_str}{short_debug_str}{div_debug_str}"
             )
             
             return {
@@ -1761,6 +1864,17 @@ async def scan_coin(
                 "long_phase_state":  long_phase["state"],
                 "spot_cvd_phase":    long_phase["spot_cvd"],
                 "fut_cvd_phase":     long_phase["fut_cvd"],
+                "short_squeeze_setup_score": long_debug.get("short_squeeze_setup_score", 0.0),
+                "short_squeeze_confirmation_score": long_debug.get("short_squeeze_confirmation_score", 0.0),
+                "short_squeeze_veto_reasons": long_debug.get("short_squeeze_veto_reasons", []),
+                "allow_short_squeeze_boost": long_debug.get("allow_short_squeeze_boost", False),
+                "downtrend_context": long_debug.get("downtrend_context", False),
+                "post_rally_context": long_debug.get("post_rally_context", False),
+                "price_reclaim_or_breakout": long_debug.get("price_reclaim_or_breakout", False),
+                "spot_state": long_debug.get("spot_state", "neutral_or_no_spot_accum"),
+                "price_response_to_spot_cvd": long_debug.get("price_response_to_spot_cvd", "neutral"),
+                "spot_absorption_risk": long_debug.get("spot_absorption_risk", False),
+                "long_score_cap_reason": long_debug.get("long_score_cap_reason", ""),
                 # ── forecast fields ────────────────────────────────────
                 "vol_ratio":      vol_ratio,
                 "vol_label":      vol_label,

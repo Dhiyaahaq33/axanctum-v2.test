@@ -105,7 +105,11 @@ def _scenario_summary(flags: List[str]) -> str:
     parts = []
     if "A"              in flags: parts.append("🟢 Spot Accum")
     if "B_SPECULATIVE"  in flags: parts.append("🟡 Spec Rally")
+    if "CONFIRMED_SHORT_SQUEEZE" in flags: parts.append("✅ Short Squeeze")
     if "C_SQUEEZE"      in flags: parts.append("🔫 Squeeze")
+    if "SQUEEZE_WATCH"  in flags and "C_SQUEEZE" not in flags: parts.append("🔫 Squeeze Watch")
+    if "SPOT_BUY_ABSORPTION" in flags: parts.append("🧲 Spot Buy Absorption")
+    if "UPSIDE_EXHAUSTION_RISK" in flags: parts.append("🪫 Upside Exhaustion")
     if "D_EXHAUSTION"   in flags: parts.append("💀 Overleveraged")
     if "E_DISTRIBUTION" in flags: parts.append("🪤 Distribution")
     return " │ ".join(parts) if parts else "─ Neutral"
@@ -269,6 +273,10 @@ def build_telegram_message(r: Dict, signal_type: str = "LONG", regime_ctx=None) 
     if "C_SQUEEZE"               in flags:
         fuel = r.get("squeeze_fuel", 0)
         signal_parts.append(f"🔫 Short Squeeze {fuel:.0f}%")
+    if "CONFIRMED_SHORT_SQUEEZE" in flags: signal_parts.append("✅ Squeeze Confirmed")
+    if "SQUEEZE_WATCH" in flags and "C_SQUEEZE" not in flags: signal_parts.append("🔫 Squeeze Watch")
+    if "SPOT_BUY_ABSORPTION" in flags: signal_parts.append("🧲 Spot Buy Absorption")
+    if "UPSIDE_EXHAUSTION_RISK" in flags: signal_parts.append("🪫 Upside Exhaustion")
     if "POST_RALLY_ROLLOVER"     in flags: signal_parts.append("📉 Post-Rally Rollover")
     if "BEARISH_CVD_ALIGNMENT"   in flags: signal_parts.append("🔴 Bearish CVD Align")
     if "LONG_SQUEEZE"            in flags:
@@ -279,6 +287,8 @@ def build_telegram_message(r: Dict, signal_type: str = "LONG", regime_ctx=None) 
     if "BREAKDOWN_SHORT"         in flags: signal_parts.append("⏬ Breakdown")
     if "EXHAUSTION_AFTER_PUMP_SHORT" in flags: signal_parts.append("🪫 Pump Exhaustion")
     if "TOP_REVERSAL_SHORT"      in flags: signal_parts.append("🎯 Top Reversal")
+    if "MICRO_REVERSAL_TRIGGER"  in flags: signal_parts.append("🧱 Micro Reversal")
+    if "BUY_PRESSURE_ABSORBED"   in flags: signal_parts.append("🧱 Buy Absorbed")
     if "DISTRIBUTION_SHORT"      in flags: signal_parts.append("🪤 Distribution Short")
     if "BEARISH_DIVERGENCE_SHORT" in flags: signal_parts.append("🎭 Bearish Divergence")
     if "BEARISH_DIVERGENCE_WATCH" in flags: signal_parts.append("🎭 Divergence Watch")
@@ -309,6 +319,12 @@ def build_telegram_message(r: Dict, signal_type: str = "LONG", regime_ctx=None) 
         warnings.append("🪤 Distribution trap — hindari long")
     if "D_EXHAUSTION" in flags:
         warnings.append("💀 Overleverage — long squeeze risk")
+    if "SQUEEZE_WATCH" in flags and "C_SQUEEZE" not in flags:
+        warnings.append("🔫 Short squeeze baru watch — butuh downtrend + reclaim/breakout")
+    if "SPOT_BUY_ABSORPTION" in flags:
+        warnings.append("🧲 Spot CVD naik tapi harga tidak respons — absorption risk")
+    if "UPSIDE_EXHAUSTION_RISK" in flags:
+        warnings.append("🪫 Upside exhaustion risk — jangan treat sebagai spot accum bersih")
     if "ABSORPTION" in flags:
         warnings.append("🧱 Absorption detected — iceberg sell")
     if "LONG_SQUEEZE" in flags:
