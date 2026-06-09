@@ -1,8 +1,128 @@
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 from ..config import CONFIG
+
+
+def classify_short_squeeze_quality(
+    *,
+    squeeze_type: str,
+    squeeze_fuel: float,
+    funding_rate: float,
+    delta_oi: float,
+    delta_price: float,
+    price_change_24h: float,
+    delta_price_short: float,
+    price_reclaim_or_breakout: bool,
+    post_rally_context: bool,
+    downtrend_context_hint: bool = False,
+) -> Dict[str, object]:
+    """Nilai short squeeze agar lebih responsif di downtrend, bukan di pucuk."""
+    setup_score = 0.0
+    confirmation_score = 0.0
+    veto_reasons: List[str] = []
+
+    downtrend_context = bool(
+        downtrend_context_hint
+        or price_change_24h <= -3.0
+        or delta_price <= -0.5
+        or delta_price_short <= -0.2
+    )
+    top_context = bool(post_rally_context and not downtrend_context)
+
+    if squeeze_type == "short":
+        setup_score += 18.0
+    if downtrend_context and squeeze_type == "short":
+        setup_score += 14.0
+    if squeeze_fuel >= 45.0:
+        setup_score += min(squeeze_fuel * 0.22, 18.0)
+    if delta_oi <= -1.5:
+        setup_score += 20.0
+    if funding_rate < -0.0003:
+        setup_score += 25.0
+    elif funding_rate < 0:
+        setup_score += 14.0
+    elif top_context:
+        veto_reasons.append("positive_funding_not_short_squeeze_fuel")
+
+    if price_reclaim_or_breakout:
+        confirmation_score += 45.0
+        if downtrend_context:
+            confirmation_score += 10.0
+    elif downtrend_context and delta_price_short > 0:
+        confirmation_score += 20.0
+    else:
+        veto_reasons.append("no_price_reclaim_or_breakout")
+
+    if delta_oi <= -1.5:
+        confirmation_score += 15.0
+    if funding_rate < 0:
+        confirmation_score += 15.0
+    if top_context and delta_price_short <= 0:
+        veto_reasons.append("top_context_without_reclaim")
+    if top_context and funding_rate > 0:
+        veto_reasons.append("top_context_positive_funding")
+
+    setup_threshold = 42.0 if downtrend_context else 50.0
+    confirmation_threshold = 45.0 if downtrend_context else 55.0
+    allow_boost = bool(
+        squeeze_type == "short"
+        and setup_score >= setup_threshold
+        and confirmation_score >= confirmation_threshold
+        and not veto_reasons
+    )
+
+    return {
+        "short_squeeze_setup_score": round(setup_score, 1),
+        "short_squeeze_confirmation_score": round(confirmation_score, 1),
+        "short_squeeze_veto_reasons": veto_reasons,
+        "allow_short_squeeze_boost": allow_boost,
+        "downtrend_context": downtrend_context,
+    }
+
+
+def classify_spot_accumulation_quality(
+    *,
+    spot_cvd_slope_short: float,
+    price_slope_short: float,
+    post_rally_context: bool,
+    price_reclaim_or_breakout: bool,
+) -> Dict[str, object]:
+    """Pisahkan spot accumulation bersih dari spot buy absorption."""
+    bullish_cvd = spot_cvd_slope_short >= 1.2
+    price_confirming = price_slope_short >= 0.20 or price_reclaim_or_breakout
+    price_not_responding = price_slope_short <= 0.10 and not price_reclaim_or_breakout
+
+    if bullish_cvd and price_confirming:
+        return {
+            "spot_state": "clean_spot_accumulation",
+            "price_response_to_spot_cvd": "confirming",
+            "spot_absorption_risk": False,
+            "long_score_cap": None,
+            "long_score_cap_reason": "",
+        }
+
+    if bullish_cvd and price_not_responding:
+        return {
+            "spot_state": "spot_buy_absorption",
+            "price_response_to_spot_cvd": "flat_or_down_after_spot_bid",
+            "spot_absorption_risk": True,
+            "long_score_cap": 58.0 if post_rally_context else 64.0,
+            "long_score_cap_reason": (
+                "spot_buy_absorption_after_rally"
+                if post_rally_context
+                else "spot_buy_absorption_without_price_response"
+            ),
+        }
+
+    return {
+        "spot_state": "neutral_or_no_spot_accum",
+        "price_response_to_spot_cvd": "neutral",
+        "spot_absorption_risk": False,
+        "long_score_cap": None,
+        "long_score_cap_reason": "",
+    }
 
 
 def calculate_market_score(
@@ -16,6 +136,9 @@ def calculate_market_score(
     fr_velocity:    float = 0.0,
     vol_ratio:      float = 1.0,
     squeeze_type:   str   = "none",
+    allow_short_squeeze_boost: bool = True,
+    spot_state: str = "neutral_or_no_spot_accum",
+    spot_accum_score_cap: float | None = None,
 ) -> Tuple[float, List[str], List[str]]:
     """
     Interdependency Scoring Matrix — Layer 1 Revisi.
@@ -61,6 +184,7 @@ def calculate_market_score(
         / (WEIGHT_SPOT + WEIGHT_FUT)
     )
     # range: -1.0 (keduanya bearish total) sampai +1.0 (keduanya bullish total)
+    spot_buy_absorption = spot_state == "spot_buy_absorption"
 
     # ── Confluence Bonus ──────────────────────────────────────────────
     # Kalau spot DAN futures keduanya bergerak searah ke atas,
@@ -69,7 +193,11 @@ def calculate_market_score(
     # CVD keduanya harus cukup signifikan, bukan sekadar positif
     _cvd_min_confluence = 2.0   # minimal 2% normalized CVD
 
-    if delta_cvd_spot > _cvd_min_confluence and delta_cvd_fut > _cvd_min_confluence:
+    if (
+        delta_cvd_spot > _cvd_min_confluence
+        and delta_cvd_fut > _cvd_min_confluence
+        and not spot_buy_absorption
+    ):
         conf_strength    = min(abs(spot_norm) * abs(fut_norm) * 4, 1.0)
         confluence_bonus = 1.0 + conf_strength * 0.18
         flags.append("CONFLUENCE")
@@ -79,7 +207,7 @@ def calculate_market_score(
         )
     elif delta_cvd_spot > 0 and delta_cvd_fut > 0:
         # Keduanya positif tapi lemah — bonus kecil, tidak ada flag
-        confluence_bonus = 1.05
+        confluence_bonus = 0.92 if spot_buy_absorption else 1.05
     elif delta_cvd_spot < 0 and delta_cvd_fut < 0:
         confluence_bonus = 0.85
     else:
@@ -184,28 +312,37 @@ def calculate_market_score(
         if squeeze_type == "long":
             oi_mod = 0.7
             contexts.append(f"⚠️ Long Squeeze Exhausted — OI {delta_oi:+.1f}% turun dalam")
-        else:
+        elif allow_short_squeeze_boost:
             oi_mod = 1.1
             flags.append("C_SQUEEZE")
             contexts.append(f"C: Squeeze Exhausted — OI {delta_oi:+.1f}% ⚠️")
+        else:
+            oi_mod = 0.95
+            contexts.append(f"🔫 OI {delta_oi:+.1f}% turun — squeeze belum confirmed")
     elif delta_oi < -_oi_ign_max:
         if squeeze_type == "long":
             oi_mod = 0.55
             contexts.append(f"💀 Long Squeeze Aktif — OI {delta_oi:+.1f}% turun, harga ikut turun")
-        else:
+        elif allow_short_squeeze_boost:
             oi_mod = 1.35
             if "C_SQUEEZE" not in flags:
                 flags.append("C_SQUEEZE")
                 contexts.append(f"C: Squeeze Aktif — OI {delta_oi:+.1f}% 🔫")
+        else:
+            oi_mod = 1.0
+            contexts.append(f"🔫 OI {delta_oi:+.1f}% turun — squeeze watch")
     elif delta_oi < -_oi_ign_min:
         if squeeze_type == "long":
             oi_mod = 0.6
             contexts.append(f"💀 Long Squeeze Ignition — OI {delta_oi:+.1f}% ⚠️")
-        else:
+        elif allow_short_squeeze_boost:
             oi_mod = 1.45
             if "C_SQUEEZE" not in flags:
                 flags.append("C_SQUEEZE")
                 contexts.append(f"C: Squeeze Ignition — OI {delta_oi:+.1f}% 🔫🔥")
+        else:
+            oi_mod = 1.0
+            contexts.append(f"🔫 OI {delta_oi:+.1f}% turun — squeeze watch")
     elif delta_oi < 0:
         oi_mod = 1.0
     elif delta_oi <= 4.0:
@@ -220,10 +357,14 @@ def calculate_market_score(
     # ── Funding Rate Modifier ─────────────────────────────────────────
     fr = funding_rate
     if fr < -0.0010:
-        fr_mod = 1.4
-        if "C_SQUEEZE" not in flags:
+        fr_mod = 1.4 if allow_short_squeeze_boost else 1.10
+        if allow_short_squeeze_boost and "C_SQUEEZE" not in flags:
             flags.append("C_SQUEEZE")
-        contexts.append(f"C: FR Sangat Negatif ({fr*100:+.4f}%) 🔫")
+        contexts.append(
+            f"C: FR Sangat Negatif ({fr*100:+.4f}%) 🔫"
+            if allow_short_squeeze_boost
+            else f"🔫 FR sangat negatif ({fr*100:+.4f}%) — squeeze watch"
+        )
     elif fr < -0.0003:
         fr_mod = 1.2
     elif fr < CONFIG["FR_NEGATIVE"]:
@@ -278,9 +419,20 @@ def calculate_market_score(
 
     final_score = max(0.0, min(100.0, raw_score * quality))
 
+    if spot_buy_absorption:
+        final_score = min(final_score * 0.72, spot_accum_score_cap or 64.0)
+        flags.append("SPOT_BUY_ABSORPTION")
+        if "BEARISH_DIVERGENCE_WATCH" not in flags:
+            flags.append("BEARISH_DIVERGENCE_WATCH")
+        if "UPSIDE_EXHAUSTION_RISK" not in flags:
+            flags.append("UPSIDE_EXHAUSTION_RISK")
+        contexts.append(
+            "🧲 Spot buy absorption: Spot CVD naik tapi harga belum ikut respons"
+        )
+
     # ── Identifikasi skenario utama ───────────────────────────────────
     if combined_demand > 0 and raw_score > 0:
-        if spot_norm > 0.25 and spot_norm >= fut_norm:
+        if spot_norm > 0.25 and spot_norm >= fut_norm and not spot_buy_absorption:
             # Spot memimpin atau setara
             flags.insert(0, "A")
             contexts.insert(

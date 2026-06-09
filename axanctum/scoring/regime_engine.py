@@ -415,7 +415,7 @@ class RegimeEngine:
             return RegimeContext(
                 regime=r, confidence=confidence,
                 long_threshold  = base - 3.0 + conf_penalty,   # sedikit lebih mudah
-                short_threshold = base + 8.0 + conf_penalty,   # short lebih ketat
+                short_threshold = base + 6.0 + conf_penalty,   # short tetap ketat, tapi reversal diberi ruang
                 w_cvd_spot=1.20, w_cvd_fut=1.10, w_oi=1.10, w_fr=0.90, w_vwap=0.95,
                 aggressiveness          = 0.85,
                 confirmation_bias       = 0.90,
@@ -431,7 +431,7 @@ class RegimeEngine:
             return RegimeContext(
                 regime=r, confidence=confidence,
                 long_threshold  = base + 8.0 + conf_penalty,
-                short_threshold = base + 8.0 + conf_penalty,
+                short_threshold = base + 6.0 + conf_penalty,
                 w_cvd_spot=0.75, w_cvd_fut=0.75, w_oi=0.70, w_fr=0.80, w_vwap=1.10,
                 aggressiveness          = 0.45,
                 confirmation_bias       = 1.40,
@@ -447,7 +447,7 @@ class RegimeEngine:
             return RegimeContext(
                 regime=r, confidence=confidence,
                 long_threshold  = base + 6.0 + conf_penalty,   # long lebih susah
-                short_threshold = base - 5.0 + conf_penalty,   # short lebih mudah
+                short_threshold = base - 4.0 + conf_penalty,   # short lebih mudah, tapi tetap butuh quality gate
                 w_cvd_spot=0.90, w_cvd_fut=0.85, w_oi=1.30, w_fr=1.40, w_vwap=1.30,
                 aggressiveness          = 0.70,
                 confirmation_bias       = 1.10,
@@ -479,7 +479,7 @@ class RegimeEngine:
             return RegimeContext(
                 regime=r, confidence=confidence,
                 long_threshold  = base - 5.0 + conf_penalty,   # long paling mudah
-                short_threshold = base + 12.0 + conf_penalty,  # short sangat ketat
+                short_threshold = base + 10.0 + conf_penalty,  # short tetap ketat, tapi tidak mati total
                 w_cvd_spot=1.30, w_cvd_fut=1.10, w_oi=1.15, w_fr=1.20, w_vwap=1.00,
                 aggressiveness          = 0.80,
                 confirmation_bias       = 1.00,
