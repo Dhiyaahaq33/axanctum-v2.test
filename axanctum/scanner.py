@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from html import escape
 from typing import Dict, List, Optional
 
 import aiohttp
@@ -47,6 +48,146 @@ from .scoring.short_engine import (
     calc_long_squeeze_score,
 )
 from .state import _FR_HISTORY_4H, _FR_VELOCITY_INTERVAL
+
+
+_NO_SIGNAL_DIAG_LAST_SENT = 0.0
+_NO_SIGNAL_DIAG_DEFAULT_INTERVAL_SEC = 60 * 60
+
+
+def _safe_num(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _top_items(counter: Dict[str, int], limit: int = 6) -> str:
+    if not counter:
+        return "none"
+    items = sorted(counter.items(), key=lambda item: (-item[1], item[0]))[:limit]
+    return ", ".join(f"{escape(str(key))}={count}" for key, count in items)
+
+
+def _candidate_digest(r: Optional[Dict], direction: str, threshold: float) -> str:
+    if not r:
+        return "none"
+
+    symbol = escape(str(r.get("symbol", "-")))
+    if direction == "LONG":
+        score = _safe_num(r.get("score_regime_adj", r.get("score", 0.0)))
+        setups_raw = r.get("long_setups") or r.get("flags", [])
+        phase = r.get("long_phase_state", "neutral")
+    else:
+        score = _safe_num(r.get("short_score_regime_adj", r.get("short_score", 0.0)))
+        setups_raw = r.get("short_setups") or r.get("short_flags", [])
+        phase = r.get("short_phase_state", r.get("short_deriv_state", "neutral"))
+
+    if isinstance(setups_raw, (list, tuple, set)):
+        setups = list(setups_raw)
+    elif setups_raw:
+        setups = [setups_raw]
+    else:
+        setups = []
+    setup_text = ",".join(str(item) for item in setups[:3]) if setups else "none"
+    return (
+        f"{symbol} {score:.1f}/{threshold:.1f} "
+        f"setup={escape(setup_text)} phase={escape(str(phase))}"
+    )
+
+
+def _should_send_no_signal_diagnostic(now: Optional[float] = None) -> bool:
+    interval = _safe_num(
+        CONFIG.get("NO_SIGNAL_DIAG_INTERVAL_MIN", 60),
+        _NO_SIGNAL_DIAG_DEFAULT_INTERVAL_SEC / 60,
+    ) * 60
+    now = time.time() if now is None else now
+    return now - _NO_SIGNAL_DIAG_LAST_SENT >= max(300.0, interval)
+
+
+def _mark_no_signal_diagnostic_sent(now: Optional[float] = None) -> None:
+    global _NO_SIGNAL_DIAG_LAST_SENT
+    _NO_SIGNAL_DIAG_LAST_SENT = time.time() if now is None else now
+
+
+def _build_no_signal_diagnostic_message(
+    *,
+    cycle_label: str,
+    results: List[Dict],
+    skipped: int,
+    errors: int,
+    elapsed_sec: float,
+    regime_ctx,
+    breadth_ctx,
+    base_long_threshold: float,
+    base_short_threshold: float,
+    long_threshold: float,
+    short_threshold: float,
+    raw_long_count: int,
+    allowed_long_count: int,
+    final_long_count: int,
+    raw_short_count: int,
+    allowed_short_count: int,
+    alert_short_count: int,
+    watch_short_count: int,
+    blocked_short_count: int,
+    short_gate_reason_counts: Dict[str, int],
+) -> str:
+    top_long = max(
+        results,
+        key=lambda item: _safe_num(item.get("score_regime_adj", item.get("score", 0.0))),
+        default=None,
+    )
+    top_short = max(
+        results,
+        key=lambda item: _safe_num(item.get("short_score_regime_adj", item.get("short_score", 0.0))),
+        default=None,
+    )
+
+    long_blocked = max(0, raw_long_count - allowed_long_count)
+    long_quality_blocked = max(0, allowed_long_count - final_long_count)
+    short_setup_blocked = max(0, raw_short_count - allowed_short_count)
+
+    lines = [
+        "🧭 <b>No-signal diagnostic</b>",
+        f"<b>{escape(cycle_label or 'Scan batch')}</b>",
+        (
+            f"Regime: <b>{escape(str(regime_ctx.regime))}</b> "
+            f"conf={_safe_num(regime_ctx.confidence):.2f} "
+            f"risk={escape(str(regime_ctx.risk_profile))}"
+        ),
+        (
+            "Threshold: "
+            f"L {_safe_num(base_long_threshold):.1f}→{_safe_num(long_threshold):.1f} | "
+            f"S {_safe_num(base_short_threshold):.1f}→{_safe_num(short_threshold):.1f}"
+        ),
+        (
+            "Breadth: "
+            f"{escape(str(breadth_ctx.direction))} "
+            f"strength={_safe_num(breadth_ctx.strength):.2f} "
+            f"L={escape(str(breadth_ctx.long_mode))} "
+            f"S={escape(str(breadth_ctx.short_mode))}"
+        ),
+        (
+            "Long gate: "
+            f"raw={raw_long_count} allowed={allowed_long_count} "
+            f"final={final_long_count} blocked={long_blocked}/{long_quality_blocked}"
+        ),
+        (
+            "Short gate: "
+            f"raw={raw_short_count} allowed={allowed_short_count} "
+            f"alert={alert_short_count} watch={watch_short_count} "
+            f"blocked={blocked_short_count} setup_blocked={short_setup_blocked}"
+        ),
+        f"Top L: {_candidate_digest(top_long, 'LONG', long_threshold)}",
+        f"Top S: {_candidate_digest(top_short, 'SHORT', short_threshold)}",
+        f"Short reasons: {_top_items(short_gate_reason_counts)}",
+        (
+            f"Scanned={len(results)} skip={skipped} err={errors} "
+            f"time={elapsed_sec:.1f}s"
+        ),
+        "<i>Diagnostic only — bukan sinyal entry.</i>",
+    ]
+    return "\n".join(lines)
 
 
 def _calc_short_execution_state(fut_df, candles_24h: int) -> Dict:
@@ -2492,6 +2633,36 @@ async def run_scan_batch(
             f"phase={top_s.get('short_phase_state', 'neutral')}"
         )
     log.info("  " + "─" * 115)
+
+    if total_alerts == 0 and _should_send_no_signal_diagnostic():
+        _mark_no_signal_diagnostic_sent()
+        diag_msg = _build_no_signal_diagnostic_message(
+            cycle_label=cycle_label,
+            results=results,
+            skipped=skipped,
+            errors=errors,
+            elapsed_sec=t_elapsed,
+            regime_ctx=regime_ctx,
+            breadth_ctx=breadth_ctx,
+            base_long_threshold=_base_long_threshold,
+            base_short_threshold=_base_short_threshold,
+            long_threshold=_long_threshold,
+            short_threshold=_short_threshold,
+            raw_long_count=len(_raw_long_candidates),
+            allowed_long_count=len(_setup_allowed_long_candidates),
+            final_long_count=len(alerts),
+            raw_short_count=len(_raw_short_candidates),
+            allowed_short_count=len(_setup_allowed_short_candidates),
+            alert_short_count=len(_quality_alert_short_candidates),
+            watch_short_count=len(_quality_watch_short_candidates),
+            blocked_short_count=len(_quality_blocked_short_candidates),
+            short_gate_reason_counts=_short_gate_reason_counts,
+        )
+        ok = await send_telegram(session, diag_msg)
+        log.info(
+            f"  🧭 No-signal diagnostic Telegram → "
+            f"{'✓ terkirim' if ok else '✗ gagal'}"
+        )
 
     # Kirim alert ke Telegram — LONG signals
     for r in alerts:
