@@ -54,6 +54,10 @@ _NO_SIGNAL_DIAG_LAST_SENT = 0.0
 _NO_SIGNAL_DIAG_DEFAULT_INTERVAL_SEC = 60 * 60
 
 
+def _no_signal_diagnostic_telegram_enabled() -> bool:
+    return bool(CONFIG.get("NO_SIGNAL_DIAG_TELEGRAM", False))
+
+
 def _safe_num(value, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -2634,7 +2638,11 @@ async def run_scan_batch(
         )
     log.info("  " + "─" * 115)
 
-    if total_alerts == 0 and _should_send_no_signal_diagnostic():
+    if (
+        total_alerts == 0
+        and _no_signal_diagnostic_telegram_enabled()
+        and _should_send_no_signal_diagnostic()
+    ):
         _mark_no_signal_diagnostic_sent()
         diag_msg = _build_no_signal_diagnostic_message(
             cycle_label=cycle_label,

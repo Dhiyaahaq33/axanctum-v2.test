@@ -1,10 +1,16 @@
 import unittest
 from types import SimpleNamespace
 
-from axanctum.scanner import _build_no_signal_diagnostic_message
+from axanctum.scanner import (
+    _build_no_signal_diagnostic_message,
+    _no_signal_diagnostic_telegram_enabled,
+)
 
 
 class NoSignalDiagnosticTest(unittest.TestCase):
+    def test_telegram_diagnostic_is_disabled_by_default(self):
+        self.assertFalse(_no_signal_diagnostic_telegram_enabled())
+
     def test_message_summarizes_thresholds_gates_and_top_candidates(self):
         msg = _build_no_signal_diagnostic_message(
             cycle_label="Siklus Test",
