@@ -2171,7 +2171,7 @@ async def scan_coin(
                 "short_score":    short_score,
                 "short_flags":    short_flags,
                 "short_contexts": short_contexts,
-                "short_regime_reasons": r.get("short_regime_reasons", []),
+                "short_regime_reasons": [],
                 "short_setups":   short_setups,
                 "short_targets":  short_targets,
                 "short_deriv_state": short_deriv_state,
