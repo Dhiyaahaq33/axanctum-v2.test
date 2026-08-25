@@ -24,6 +24,9 @@ CONFIG: Dict = {
     # Set sebelum run: export TELEGRAM_TOKEN="..." TELEGRAM_CHAT_ID="..."
     "TELEGRAM_TOKEN":   os.environ.get("TELEGRAM_TOKEN",   ""),
     "TELEGRAM_CHAT_ID": os.environ.get("TELEGRAM_CHAT_ID", ""),
+    # Bot/chat kedua (opsional) - alert yang sama dikirim ke keduanya sekaligus.
+    "TELEGRAM_TOKEN_2":   os.environ.get("TELEGRAM_TOKEN_2",   ""),
+    "TELEGRAM_CHAT_ID_2": os.environ.get("TELEGRAM_CHAT_ID_2", ""),
 
     # ── 3-Cycle Settings ──────────────────────────────────────────────────
     # Setiap siklus punya batas koin dan minimum volume sendiri.

@@ -115,18 +115,30 @@ def _scenario_summary(flags: List[str]) -> str:
     return " │ ".join(parts) if parts else "─ Neutral"
 
 
-async def send_telegram(
+def _telegram_targets() -> List[Tuple[str, str]]:
+    """Semua pasangan (token, chat_id) yang terisi di config - biasanya 1,
+    tapi bisa 2 kalau TELEGRAM_TOKEN_2/TELEGRAM_CHAT_ID_2 di-set (broadcast
+    alert yang sama ke dua bot/chat sekaligus)."""
+    pairs = [
+        (CONFIG.get("TELEGRAM_TOKEN", ""), CONFIG.get("TELEGRAM_CHAT_ID", "")),
+        (CONFIG.get("TELEGRAM_TOKEN_2", ""), CONFIG.get("TELEGRAM_CHAT_ID_2", "")),
+    ]
+    return [(t, c) for t, c in pairs if t and c]
+
+
+async def _send_telegram_one(
     session: aiohttp.ClientSession,
+    token: str,
+    chat_id: str,
     message: str,
 ) -> bool:
-    """Kirim pesan HTML ke Telegram chat/group yang dikonfigurasi."""
-    url = f"{TELEGRAM_API}/bot{CONFIG['TELEGRAM_TOKEN']}/sendMessage"
+    url = f"{TELEGRAM_API}/bot{token}/sendMessage"
     try:
         timeout = aiohttp.ClientTimeout(total=15)
         async with session.post(
             url,
             json={
-                "chat_id":    CONFIG["TELEGRAM_CHAT_ID"],
+                "chat_id":    chat_id,
                 "text":       message,
                 "parse_mode": "HTML",
             },
@@ -140,6 +152,22 @@ async def send_telegram(
     except Exception as exc:
         log.error(f"send_telegram error: {exc}")
         return False
+
+
+async def send_telegram(
+    session: aiohttp.ClientSession,
+    message: str,
+) -> bool:
+    """Kirim pesan HTML ke semua bot/chat Telegram yang dikonfigurasi
+    (1 atau 2 tujuan sekaligus). Return True kalau minimal satu berhasil."""
+    targets = _telegram_targets()
+    if not targets:
+        log.warning("send_telegram: tidak ada TELEGRAM_TOKEN/CHAT_ID yang terisi.")
+        return False
+    results = await asyncio.gather(
+        *[_send_telegram_one(session, token, chat_id, message) for token, chat_id in targets]
+    )
+    return any(results)
 
 
 def build_telegram_message(r: Dict, signal_type: str = "LONG", regime_ctx=None) -> str:
