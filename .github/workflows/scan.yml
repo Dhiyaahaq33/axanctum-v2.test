@@ -1,0 +1,42 @@
+name: Axanctum Scan (24/7 via OKX)
+
+on:
+  schedule:
+    # tiap 5 menit - minimum interval yang didukung GitHub Actions
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: axanctum-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # alert_cooldown_state.json sengaja tidak masuk git - dipertahankan
+      # lewat cache biar tidak kirim alert dobel untuk sinyal yang sama
+      # tiap run (pola sama seperti last_alerts.json di high-tf).
+      - name: Restore cooldown state dari cache run sebelumnya
+        uses: actions/cache@v4
+        with:
+          path: alert_cooldown_state.json
+          key: axanctum-cooldown-${{ github.run_id }}
+          restore-keys: |
+            axanctum-cooldown-
+
+      - name: Scan market (OKX) & kirim alert
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scan_once.py
