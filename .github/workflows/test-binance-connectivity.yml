@@ -8,27 +8,55 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Ping Binance Spot API
+      - name: Binance Spot + Futures
         run: |
-          echo "--- Spot ping ---"
-          curl -sS -w "\nHTTP %{http_code}\n" https://api.binance.com/api/v3/ping || true
-          echo "--- Spot time ---"
-          curl -sS -w "\nHTTP %{http_code}\n" https://api.binance.com/api/v3/time || true
-          echo "--- Spot klines BTCUSDT ---"
-          curl -sS -w "\nHTTP %{http_code}\n" "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=2" || true
+          echo "== Binance Spot ping =="
+          curl -sS -o /dev/null -w "HTTP %{http_code}\n" https://api.binance.com/api/v3/ping
+          echo "== Binance Futures ping =="
+          curl -sS -o /dev/null -w "HTTP %{http_code}\n" https://fapi.binance.com/fapi/v1/ping
 
-      - name: Ping Binance Futures API
+      - name: Bybit
         run: |
-          echo "--- Futures ping ---"
-          curl -sS -w "\nHTTP %{http_code}\n" https://fapi.binance.com/fapi/v1/ping || true
-          echo "--- Futures time ---"
-          curl -sS -w "\nHTTP %{http_code}\n" https://fapi.binance.com/fapi/v1/time || true
-          echo "--- Futures klines BTCUSDT ---"
-          curl -sS -w "\nHTTP %{http_code}\n" "https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=2" || true
-          echo "--- Futures funding rate BTCUSDT ---"
-          curl -sS -w "\nHTTP %{http_code}\n" "https://fapi.binance.com/fapi/v1/fundingRate?symbol=BTCUSDT&limit=1" || true
-          echo "--- Futures open interest BTCUSDT ---"
-          curl -sS -w "\nHTTP %{http_code}\n" "https://fapi.binance.com/futures/data/openInterestHist?symbol=BTCUSDT&period=1h&limit=2" || true
+          echo "== Bybit server time =="
+          curl -sS -o /dev/null -w "HTTP %{http_code}\n" https://api.bybit.com/v5/market/time
+          echo "== Bybit kline (linear BTCUSDT) =="
+          curl -sS -w "\nHTTP %{http_code}\n" "https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval=60&limit=2"
+          echo "== Bybit funding rate history =="
+          curl -sS -w "\nHTTP %{http_code}\n" "https://api.bybit.com/v5/market/funding/history?category=linear&symbol=BTCUSDT&limit=1"
+          echo "== Bybit open interest =="
+          curl -sS -w "\nHTTP %{http_code}\n" "https://api.bybit.com/v5/market/open-interest?category=linear&symbol=BTCUSDT&intervalTime=1h&limit=2"
 
-      - name: Runner egress IP / region info
+      - name: OKX
+        run: |
+          echo "== OKX time =="
+          curl -sS -o /dev/null -w "HTTP %{http_code}\n" https://www.okx.com/api/v5/public/time
+          echo "== OKX candles (BTC-USDT-SWAP) =="
+          curl -sS -w "\nHTTP %{http_code}\n" "https://www.okx.com/api/v5/market/candles?instId=BTC-USDT-SWAP&bar=1H&limit=2"
+          echo "== OKX funding rate =="
+          curl -sS -w "\nHTTP %{http_code}\n" "https://www.okx.com/api/v5/public/funding-rate?instId=BTC-USDT-SWAP"
+          echo "== OKX open interest =="
+          curl -sS -w "\nHTTP %{http_code}\n" "https://www.okx.com/api/v5/public/open-interest?instId=BTC-USDT-SWAP"
+
+      - name: HyperLiquid
+        run: |
+          echo "== HyperLiquid meta info (POST) =="
+          curl -sS -w "\nHTTP %{http_code}\n" -X POST https://api.hyperliquid.xyz/info -H "Content-Type: application/json" -d '{"type":"meta"}'
+          echo "== HyperLiquid funding history =="
+          curl -sS -w "\nHTTP %{http_code}\n" -X POST https://api.hyperliquid.xyz/info -H "Content-Type: application/json" -d '{"type":"fundingHistory","coin":"BTC","startTime":1735689600000}'
+
+      - name: Kraken Futures
+        run: |
+          echo "== Kraken Futures tickers =="
+          curl -sS -o /dev/null -w "HTTP %{http_code}\n" https://futures.kraken.com/derivatives/api/v3/tickers
+          echo "== Kraken Futures history OHLC =="
+          curl -sS -w "\nHTTP %{http_code}\n" "https://futures.kraken.com/api/charts/v1/trade/PF_XBTUSD/1h?count=2"
+
+      - name: Gate.io
+        run: |
+          echo "== Gate.io futures BTC_USDT contract =="
+          curl -sS -w "\nHTTP %{http_code}\n" "https://api.gateio.ws/api/v4/futures/usdt/contracts/BTC_USDT"
+          echo "== Gate.io futures candles =="
+          curl -sS -w "\nHTTP %{http_code}\n" "https://api.gateio.ws/api/v4/futures/usdt/candlesticks?contract=BTC_USDT&interval=1h&limit=2"
+
+      - name: Runner egress info
         run: curl -sS https://ipinfo.io/json || true
