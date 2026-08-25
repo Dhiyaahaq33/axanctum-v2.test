@@ -1,0 +1,34 @@
+name: Test Binance Connectivity (manual)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping Binance Spot API
+        run: |
+          echo "--- Spot ping ---"
+          curl -sS -w "\nHTTP %{http_code}\n" https://api.binance.com/api/v3/ping || true
+          echo "--- Spot time ---"
+          curl -sS -w "\nHTTP %{http_code}\n" https://api.binance.com/api/v3/time || true
+          echo "--- Spot klines BTCUSDT ---"
+          curl -sS -w "\nHTTP %{http_code}\n" "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=2" || true
+
+      - name: Ping Binance Futures API
+        run: |
+          echo "--- Futures ping ---"
+          curl -sS -w "\nHTTP %{http_code}\n" https://fapi.binance.com/fapi/v1/ping || true
+          echo "--- Futures time ---"
+          curl -sS -w "\nHTTP %{http_code}\n" https://fapi.binance.com/fapi/v1/time || true
+          echo "--- Futures klines BTCUSDT ---"
+          curl -sS -w "\nHTTP %{http_code}\n" "https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=2" || true
+          echo "--- Futures funding rate BTCUSDT ---"
+          curl -sS -w "\nHTTP %{http_code}\n" "https://fapi.binance.com/fapi/v1/fundingRate?symbol=BTCUSDT&limit=1" || true
+          echo "--- Futures open interest BTCUSDT ---"
+          curl -sS -w "\nHTTP %{http_code}\n" "https://fapi.binance.com/futures/data/openInterestHist?symbol=BTCUSDT&period=1h&limit=2" || true
+
+      - name: Runner egress IP / region info
+        run: curl -sS https://ipinfo.io/json || true
